@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "osquery-opamp"
+version = "0.1.0"
+description = "OpAMP agent for osquery, as an osquery extension"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "thriftpy2>=0.7",
+    "protobuf>=7.34.1,<8",
+    "websocket-client>=1.8",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+osquery-opamp = "osquery_opamp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
