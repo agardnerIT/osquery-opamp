@@ -88,6 +88,8 @@ class OpampAgent:
         sdk_version_source: str = "",
         validate_queries: bool = True,
         state_interval: float = DEFAULT_STATE_INTERVAL,
+        config_service: Any = None,
+        pull_mode: bool = False,
         clock: Callable[[], float] = time.time,
     ) -> None:
         constants.capabilities_sanity_check()
@@ -116,6 +118,13 @@ class OpampAgent:
         self._applied_body: Optional[bytes] = None
         self._applied_config: Optional[Dict[str, Any]] = None
 
+        # Durability (see ``configcache``): ``config_service`` is the
+        # ``ExtensionService`` that answers ``genConfig``, so the two must agree
+        # about the body. ``pull_mode`` means the daemon's active config plugin is
+        # this extension, which is what makes adopting the cached metadata safe.
+        self.config_service = config_service
+        self.pull_mode = pull_mode
+
         self.health = Health()
         self.start_time_unix_nano = int(clock() * 1_000_000_000)
 
@@ -136,6 +145,104 @@ class OpampAgent:
         self._status_dirty = True
 
         self._ignored_uid_messages = 0
+
+        self._restore_cached_config()
+
+    # -- durability --------------------------------------------------------
+
+    def _restore_cached_config(self) -> None:
+        """Adopt the config the previous process applied, before the first message.
+
+        Only in **pull mode**, and only because that is the one mode where the claim
+        is verifiable: the daemon's config plugin is this extension, so a boot asks
+        ``genConfig`` and is answered from this same cache. Reporting ``APPLIED``
+        with the stored hash then means exactly what the spec says - the agent is
+        running that config - and it stops the server from re-delivering a config
+        the fleet already has (and from counting the restart against
+        ``CONFIG_MAX_DELIVERY_ATTEMPTS``).
+
+        In push mode (``--config_plugin=filesystem``, our body merged as a source)
+        nothing is adopted: a restarted daemon re-read its file and does *not* have
+        our config, so the honest state is ``UNSET`` and the server must re-deliver.
+        The body is still cached there, because switching the daemon to pull mode
+        should not require re-pushing the fleet first.
+        """
+        service = self.config_service
+        if service is None or not self.pull_mode:
+            return
+        where = getattr(service, "cache_path", "the config cache")
+        try:
+            entry = service.cached_entry()
+        except Exception as exc:  # noqa: BLE001 - a cache must never block startup
+            log.warning("could not read the config cache: %s", exc)
+            return
+        if entry is None:
+            log.info("no cached config yet (%s); waiting for the OpAMP server", where)
+            return
+        try:
+            parsed = json.loads(entry.body)
+        except ValueError as exc:
+            log.warning(
+                "cached config in %s is not valid JSON (%s); ignoring it",
+                where,
+                exc,
+            )
+            return
+        if not isinstance(parsed, dict):
+            log.warning("cached config in %s is not a JSON object; ignoring it", where)
+            return
+
+        self._applied_body = entry.body.encode("utf-8")
+        self._applied_config = parsed
+        self._effective_config_dirty = True
+
+        if not entry.config_hash:
+            log.info(
+                "restored %d bytes of config from %s for genConfig, but no OpAMP hash "
+                "was stored; status stays UNSET until the server sends one",
+                len(self._applied_body),
+                where,
+            )
+            return
+        try:
+            self.last_remote_config_hash = bytes.fromhex(entry.config_hash)
+        except ValueError:
+            log.warning(
+                "cached config hash %r is not hex; reporting UNSET instead",
+                entry.config_hash,
+            )
+            return
+
+        self.remote_config_status = opamp.RemoteConfigStatuses_APPLIED
+        self.remote_config_error = ""
+        self._status_dirty = True
+        log.info(
+            "restored config from %s (%d bytes, hash=%s, applied %s); the daemon is "
+            "served this at boot and APPLIED is reported without waiting for the server",
+            where,
+            len(self._applied_body),
+            entry.config_hash[:16],
+            entry.applied_at or "unknown",
+        )
+
+    def _remember(self, body: bytes, report_hash: bytes, content_type: str = "") -> None:
+        """Persist the body the daemon just accepted, for the next restart.
+
+        Called only after ``Config::update()`` returned OK, so the cache never holds
+        a config the daemon rejected. Every failure is a log line: durability is
+        best effort, and an applied config is not un-applied because a disk is full.
+        """
+        if self.config_service is None:
+            return
+        try:
+            self.config_service.set_config_body(
+                self.source,
+                body.decode("utf-8"),
+                content_type=content_type or constants.CONFIG_CONTENT_TYPE,
+                config_hash=report_hash.hex() if report_hash else "",
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail an applied config
+            log.warning("could not cache the applied config for the next restart: %s", exc)
 
     # -- outbound ----------------------------------------------------------
 
@@ -285,6 +392,10 @@ class OpampAgent:
             # Re-applying it churns the daemon's config hash and status logs for
             # no reason; the spec gives us the hash precisely to detect this.
             log.debug("remote config unchanged (hash=%s); not re-applying", report_hash.hex()[:16])
+            # Re-offered after a restart (ours or the daemon's): make sure the cache
+            # describes it, so the next boot can be served it even if this process
+            # was the one that came back without one.
+            self._remember(body, report_hash, content_type)
             self._effective_config_dirty = True
             return
 
@@ -321,6 +432,8 @@ class OpampAgent:
 
         self._applied_body = body
         self._applied_config = parsed
+        # The daemon accepted it, so this is the body a restart must be served.
+        self._remember(body, report_hash, content_type)
         self.remote_config_status = opamp.RemoteConfigStatuses_APPLIED
         self.remote_config_error = ""
         self._status_dirty = True

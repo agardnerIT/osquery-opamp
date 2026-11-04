@@ -171,3 +171,47 @@ def test_cli_reports_the_daemons_own_config_source_in_effective_config(cli, daem
     )
     keys = set(report.effective_config.config_map.config_map)
     assert "osquery.config.json" in keys, keys
+
+
+def test_config_cache_flag_defaults_to_the_state_directory_and_can_be_disabled(tmp_path, monkeypatch):
+    """A restart is only survivable if the cache path is a decision, not a surprise."""
+    import sys
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "src"))
+    from osquery_opamp.__main__ import build_parser
+
+    args = build_parser().parse_args(["--endpoint", "ws://127.0.0.1:4320/v1/opamp"])
+    assert args.config_cache.endswith("osquery-opamp/config.json")
+
+    monkeypatch.setenv("OSQUERY_OPAMP_CONFIG_CACHE", str(tmp_path / "elsewhere.json"))
+    from osquery_opamp.configcache import default_config_path
+
+    assert default_config_path() == tmp_path / "elsewhere.json"
+
+    disabled = build_parser().parse_args(
+        ["--endpoint", "ws://127.0.0.1:4320/v1/opamp", "--config-cache", ""]
+    )
+    assert disabled.config_cache == ""
+
+
+def test_pull_mode_is_detected_from_the_daemons_active_config_plugin():
+    import sys
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "src"))
+    from osquery_opamp.__main__ import _is_pull_mode
+
+    class Core:
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def active_config_plugin(self):
+            if self.plugin is None:
+                raise OSError("socket closed")
+            return self.plugin
+
+    assert _is_pull_mode(Core("opamp"), "opamp") is True
+    assert _is_pull_mode(Core("filesystem"), "opamp") is False
+    assert _is_pull_mode(Core(""), "opamp") is False
+    assert _is_pull_mode(Core(None), "opamp") is False, "an unanswerable daemon is not pull mode"

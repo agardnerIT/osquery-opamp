@@ -531,3 +531,164 @@ def test_agent_detects_one_query_defined_by_two_config_sources(daemon_with_local
         assert "battery_stats" in agent.health.last_error
     finally:
         extension.stop()
+
+
+# --------------------------------------- durability: genConfig after a restart
+
+BODY_TEXT = '{"schedule": {"battery_stats": {"query": "SELECT percent_remaining FROM battery;", "interval": 30}}}'
+HASH_HEX = "22aa53ff9c3b270753bf4cb01d23ccc7593fbf4e8436ccb4a516cbf35742d576"
+
+
+def _service(tmp_path, *, body=None, config_hash="", agent_version="0.1.0"):
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import ExtensionService
+
+    service = ExtensionService(ConfigCache(tmp_path / "config.json"))
+    service.agent_version = agent_version
+    if body is not None:
+        service.set_config_body("opamp", body, config_hash=config_hash)
+    return service
+
+
+def test_genconfig_survives_an_extension_restart(tmp_path):
+    """The whole point: the daemon gets its config back without the OpAMP server.
+
+    Before this, ``genConfig`` answered from a dict in the extension process, so a
+    restart (or a host reboot) meant the daemon booted on ``--config_path`` - the
+    fleet's config silently reverting to whatever that file held.
+    """
+    _service(tmp_path, body=BODY_TEXT, config_hash=HASH_HEX)
+
+    # A brand-new process: empty memory, same cache file.
+    restarted = _service(tmp_path)
+    assert restarted.cached_config("opamp") == BODY_TEXT
+    assert restarted.cached_entry().config_hash == HASH_HEX
+
+
+def test_genconfig_serves_the_cached_body_through_a_real_daemon(daemon, tmp_path):
+    """End to end: a fresh extension answers ``genConfig`` from disk, no push."""
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import OsqueryExtension
+    from osquery_opamp.osquery_thrift import make_manager_client
+
+    _service(tmp_path, body=BODY_TEXT, config_hash=HASH_HEX)
+
+    ext = OsqueryExtension(
+        daemon.socket, version="0.1.0", config_cache=ConfigCache(tmp_path / "config.json")
+    )
+    ext.start()
+    try:
+        response = make_manager_client(daemon.socket).call(
+            "config", "opamp", {"action": "genConfig"}
+        )
+        assert response.status.code == 0
+        assert response.response[0]["opamp"] == BODY_TEXT, (
+            "the cached body must be served byte for byte, not re-serialised"
+        )
+    finally:
+        ext.stop()
+
+
+def test_a_new_body_drops_the_stale_hash(tmp_path):
+    """A hash describes one body. Keeping it next to a different body is a lie."""
+    service = _service(tmp_path, body=BODY_TEXT, config_hash=HASH_HEX)
+    service.set_config_body("opamp", '{"schedule": {}}')
+    entry = service.cached_entry()
+    assert entry.body == '{"schedule": {}}'
+    assert entry.config_hash == "", "the old hash must not be attached to a new body"
+
+
+def test_resending_the_same_body_keeps_the_hash(tmp_path):
+    """The server re-offers with the hash it already acked; that is not a new hash."""
+    service = _service(tmp_path, body=BODY_TEXT, config_hash=HASH_HEX)
+    service.set_config_body("opamp", BODY_TEXT)
+    assert service.cached_entry().config_hash == HASH_HEX
+
+
+def test_memory_is_preferred_and_disk_is_the_fallback(tmp_path):
+    service = _service(tmp_path, body=BODY_TEXT, config_hash=HASH_HEX)
+    assert service.cached_config("opamp") == BODY_TEXT
+    # A different source is not invented from the cache.
+    assert service.cached_config("something-else") is None
+
+
+def test_a_restarted_daemon_is_served_the_cached_config(tmp_path):
+    """The failure this whole cache exists for, end to end.
+
+    Boot a `--config_plugin=opamp` daemon, let the extension serve it a config,
+    then restart *the daemon* with no OpAMP server, no re-push and no
+    ``--config_enable_backup``. Before the cache existed the second boot came up
+    with no config (``genConfig`` had nothing to answer with), and a push-mode
+    daemon came up on its own ``--config_path`` while the server still showed
+    ``APPLIED``.
+
+    Two daemons, same socket, same cache file; the only state carried across is
+    what the extension persisted.
+    """
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from conftest import Daemon
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import OsqueryExtension
+
+    body = '{"schedule": {"from_cache": {"query": "select 1 as n from osquery_info;", "interval": 300}}}'
+    cache_path = tmp_path / "config.json"
+    root = Path(tempfile.mkdtemp(prefix="osq-restart-"))
+    socket_path = root / "osq.em"
+    names = set()
+    first = second = None
+    try:
+        daemon = Daemon(
+            root, config_plugin="opamp", extensions_require="opamp", extensions_timeout="30"
+        )
+        first = OsqueryExtension(
+            daemon.socket, version="0.1.0", pull_wait=20.0, config_cache=ConfigCache(cache_path)
+        )
+        # What the OpAMP apply path does: remember, then let genConfig serve it.
+        first.service.set_config_body("opamp", body, config_hash=HASH_HEX)
+        first.start(wait=25.0)
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if "from_cache" in {row["name"] for row in first.core.scheduled_queries()}:
+                break
+            time.sleep(0.2)
+        assert ConfigCache(cache_path).load().body == body
+        first.stop()
+        first = None
+        daemon.stop()
+
+        # Fresh daemon, fresh extension process state: only the file survives.
+        socket_path.unlink(missing_ok=True)
+        daemon = Daemon(
+            root, config_plugin="opamp", extensions_require="opamp", extensions_timeout="30"
+        )
+        assert ConfigCache(cache_path).load() is not None
+        second = OsqueryExtension(
+            daemon.socket, version="0.1.0", pull_wait=20.0, config_cache=ConfigCache(cache_path)
+        )
+        second.start(wait=25.0)
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            names = {row["name"] for row in second.core.scheduled_queries()}
+            if "from_cache" in names:
+                break
+            time.sleep(0.2)
+    finally:
+        for ext in (first, second):
+            if ext is not None:
+                try:
+                    ext.stop()
+                except Exception:
+                    pass
+        try:
+            daemon.stop()
+        except Exception:
+            pass
+
+    assert "from_cache" in names, (
+        "the restarted daemon booted without the cached config; genConfig did not serve it"
+    )

@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from .configcache import CachedConfig, ConfigCache
 from .core import CoreClient
 from .osquery_thrift import (
     EXT_FAILED,
@@ -47,13 +48,16 @@ class ExtensionService:
     """Implementation of the daemon-facing ``Extension`` Thrift service.
 
     The daemon calls ``ping()`` for liveness and ``call()`` when one of the
-    registry items this extension advertised is invoked. Because this extension
-    also *pushes* config, ``call()`` is mostly a fallback: it answers
-    ``genConfig`` with the last configuration we were given, which is what makes
-    ``--config_plugin=opamp`` work.
+    registry items this extension advertised is invoked. ``genConfig`` is not a
+    fallback: with ``--config_plugin=opamp`` it is how the daemon gets its config
+    at every boot, so what it answers has to outlive this process. The body the
+    daemon accepted is therefore served from RAM first and from
+    :class:`~osquery_opamp.configcache.ConfigCache` second, which is what makes a
+    restart (of the extension, the daemon, or the host) keep the fleet's config
+    instead of reverting to whatever ``--config_path`` holds.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cache: Optional[ConfigCache] = None) -> None:
         self.uuid: int = 0
         self.ping_count: int = 0
         self.first_ping: threading.Event = threading.Event()
@@ -63,6 +67,14 @@ class ExtensionService:
         self._shutdown = threading.Event()
         self.on_shutdown: Optional[Callable[[], None]] = None
 
+        #: Durable copy of the last applied config (``None`` disables persistence).
+        self.cache: Optional[ConfigCache] = cache
+        #: Version string recorded in the cache entry, for "which agent wrote this".
+        self.agent_version: str = ""
+        self._cache_lock = threading.Lock()
+        self._entry: Optional[CachedConfig] = None
+        self._entry_loaded = False
+
         #: Source a bare ``genConfig`` (the daemon sends no ``source`` when this
         #: extension is the active config plugin) is answered from.
         self.default_source: str = EXTENSION_NAME
@@ -71,14 +83,80 @@ class ExtensionService:
 
     # -- state -------------------------------------------------------------
 
+    @property
+    def cache_path(self) -> str:
+        """Where the config is persisted, or a phrase saying it is not."""
+        if self.cache is None or self.cache.path is None:
+            return "no persistent config cache"
+        return str(self.cache.path)
+
     def set_config(self, source: str, config: Dict[str, Any]) -> None:
+        """Remember a config given as data (tests, ``push_config``)."""
+        self.set_config_body(source, json.dumps(config))
+
+    def set_config_body(
+        self,
+        source: str,
+        body: str,
+        *,
+        content_type: str = "",
+        config_hash: str = "",
+    ) -> None:
+        """Remember the exact body the daemon accepted, and persist it.
+
+        The body is a **string**, not a dict: this is the text osquery parsed, and
+        re-serialising it would change the bytes for no benefit. ``config_hash``
+        is the server's opaque value in hex; when it is omitted and the body is
+        unchanged, the previous hash is kept, and when the body is new the hash is
+        dropped rather than left describing a config that is no longer current.
+        """
+        previous = self.cached_entry()
+        entry = CachedConfig(
+            source=source,
+            body=body,
+            content_type=content_type or (
+                previous.content_type if previous is not None else "application/json"
+            ),
+            config_hash=config_hash or (
+                previous.config_hash
+                if previous is not None and previous.body == body
+                else ""
+            ),
+            agent_version=self.agent_version
+            or (previous.agent_version if previous is not None else ""),
+        )
+        with self._cache_lock:
+            self._entry = entry
+            self._entry_loaded = True
         with self._config_ready:
-            self._config_by_source[source] = json.dumps(config)
+            self._config_by_source[source] = body
             self._config_ready.notify_all()
+        if self.cache is not None:
+            self.cache.save(entry)
+
+    def cached_entry(self) -> Optional[CachedConfig]:
+        """The last applied config with its metadata, from RAM or from disk."""
+        with self._cache_lock:
+            if not self._entry_loaded:
+                self._entry = self.cache.load() if self.cache is not None else None
+                self._entry_loaded = True
+            return self._entry
 
     def cached_config(self, source: str) -> Optional[str]:
+        """The body to serve for ``source``, memory first, durable cache second."""
         with self._lock:
-            return self._config_by_source.get(source)
+            body = self._config_by_source.get(source)
+        if body is not None:
+            return body
+        entry = self.cached_entry()
+        if entry is None or entry.source != source:
+            return None
+        # Seed the in-memory copy so the next ``genConfig`` is a dict lookup. This
+        # is the cold-start path: a daemon that booted before the OpAMP server was
+        # reachable is answered from disk, not with a failure.
+        with self._lock:
+            self._config_by_source.setdefault(source, entry.body)
+        return entry.body
 
     def wait_for_config(self, source: str, timeout: float) -> Optional[str]:
         """Block until ``source`` has a config, or ``timeout`` elapses.
@@ -143,6 +221,12 @@ class ExtensionService:
                     )
                     cached = self.wait_for_config(source, self.pull_wait)
                 if cached is None:
+                    log.warning(
+                        "no config to serve for source %r (%s); reporting a failed "
+                        "refresh so osquery keeps its current state",
+                        source,
+                        self.cache_path,
+                    )
                     return ExtensionResponse(
                         status=ExtensionStatus(
                             code=EXT_FAILED,
@@ -200,6 +284,7 @@ class OsqueryExtension:
         registry: Optional[Dict[str, Dict[str, List[Dict[str, str]]]]] = None,
         source: str = EXTENSION_NAME,
         pull_wait: float = 0.0,
+        config_cache: Optional[ConfigCache] = None,
     ) -> None:
         self.manager_socket = manager_socket
         self.name = name
@@ -216,9 +301,10 @@ class OsqueryExtension:
         self.sdk_version = sdk_version or MIN_SDK_VERSION
         self.sdk_version_source = "pinned" if sdk_version else "unknown"
 
-        self.service = ExtensionService()
+        self.service = ExtensionService(config_cache)
         self.service.default_source = source
         self.service.pull_wait = pull_wait
+        self.service.agent_version = version
         self.core = CoreClient(manager_socket)
         self.uuid: int = 0
         self.socket_path: str = ""
@@ -400,7 +486,13 @@ class OsqueryExtension:
     # -- convenience -------------------------------------------------------
 
     def push_config(self, source: str, config: Dict[str, Any]) -> Any:
-        """Push config to the daemon and remember it for ``genConfig``."""
+        """Push config to the daemon and remember it for ``genConfig``.
+
+        Only used by callers that have a config but no OpAMP hash (tests, one-off
+        tooling). The agent's own apply path uses ``push_config_raw`` on the core
+        and :meth:`ExtensionService.set_config_body`, so the body persisted for the
+        next boot is the byte-for-byte text the daemon accepted, hash included.
+        """
         result = self.core.push_config(source, config)
         if result.ok:
             self.service.set_config(source, config)

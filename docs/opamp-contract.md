@@ -117,8 +117,41 @@ that source wholesale; it does not merge keys. Other sources (the daemon's own
 config plugin output) are untouched, so a pushed config coexists with a
 filesystem config.
 
-On a daemon restart the pushed source is gone until the extension re-pushes it.
-There is a window at boot where the daemon runs on its own config only.
+A source is runtime state: it lives in the daemon's memory, not in
+`--config_path`, and a daemon restart drops it. See "Surviving a restart" below
+for what the agent does about that (and why `--config_plugin=opamp` is the mode
+that survives a reboot).
+
+## Surviving a restart
+
+Three things can restart, and only the agent can make the config outlive them.
+The extension keeps the last accepted body in `--config-cache`
+(default `$XDG_STATE_HOME/osquery-opamp/config.json`, `0600`, written atomically)
+together with the server's `config_hash`.
+
+| What restarts | What happens | How it works |
+| --- | --- | --- |
+| the extension | daemon keeps running | nothing needed; the config is in the daemon already |
+| the extension, then the daemon asks for config | served from disk | `genConfig` reads the cache before the OpAMP server is reachable |
+| the daemon (`--config_plugin=opamp`) | served from disk | the daemon's first `Config::refresh()` calls `genConfig`, which answers from the cache |
+| the daemon (`--config_plugin=filesystem`) | **not** restored | the daemon re-reads `--config_path`; the agent reports `UNSET` and the server re-delivers, which re-creates the source |
+| the host, `--config_plugin=opamp` | served from disk | the extension starts, loads the cache, and answers the daemon's boot-time `genConfig` |
+
+In pull mode the agent also re-adopts the cached `config_hash` at startup and
+reports `APPLIED` in its first message. That is not cosmetic: the spec's
+reconciliation is hash-based, so a restart that reported `UNSET` would make the
+server re-deliver a config the fleet already runs - and burn one of
+`CONFIG_MAX_DELIVERY_ATTEMPTS` doing it. In push mode the cached metadata is
+deliberately **not** adopted, because the restarted daemon really does not have
+the config: reporting `APPLIED` there would be a lie the server acts on.
+
+osquery has its own backstop, `--config_enable_backup`: it copies every config
+source into the daemon's database and restores them when the first refresh of a
+process *fails* (`Config::restoreConfigBackup`). With
+`--config_plugin=filesystem` the first refresh succeeds, so the backup is never
+read - it cannot rescue a merged source. With `--config_plugin=opamp` it is
+redundant (the cache answers the refresh) but worth enabling anyway: it covers a
+host where the extension cannot start at all.
 
 ## Pull mode requires `--extensions_require`
 
@@ -145,8 +178,28 @@ retry. Treat the two flags as a unit.
 Once registered in time, the daemon calls `genConfig` once (no `source` key in
 the request; the extension answers from `--source`, default `opamp`) and caches
 the result. `--pull-wait` bounds how long that call may block waiting for the
-first OpAMP config. Returning `EXT_FAILED` there is honest but not fatal: the
-first `config/update` push repairs the daemon without a restart.
+first OpAMP config - and only the *first*: after that the answer comes from the
+config cache, so a later boot does not wait for the server at all. Returning
+`EXT_FAILED` there is honest but not fatal: the first `config/update` push
+repairs the daemon without a restart.
+
+The extension detects the mode itself (`osquery_info` → `config_plugin`) and logs
+which one it is running, because "restarting the daemon keeps the config" is true
+in only one of them:
+
+```
+config mode: PULL - 'opamp' is the daemon's --config_plugin, so the daemon is
+served config over genConfig and a restart is served ~/.local/state/osquery-opamp/config.json
+```
+
+Recommended deployment, no file on the host to fight with:
+
+```bash
+osqueryd --config_plugin=opamp --extensions_require=opamp --extensions_timeout=30 \
+         --config_enable_backup=true
+python -m osquery_opamp --endpoint https://opamp.example.com/v1/opamp \
+         --header 'Authorization: Bearer …'
+```
 
 ## Identity
 

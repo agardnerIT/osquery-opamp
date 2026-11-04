@@ -1,6 +1,11 @@
 """Run the agent: osquery extension on one side, OpAMP server on the other.
 
-    python -m osquery_opamp --endpoint wss://opamp.example.com/v1/opamp
+    python -m osquery_opamp --endpoint http://localhost:4320/v1/opamp
+
+The endpoint scheme picks the transport: ``http(s)://`` for the spec's
+request/reply transport (works against any server, no server-side opt-in),
+``ws(s)://`` for websocket (needs the server to accept the upgrade, and lets it
+push without waiting for a poll).
 
 Shutdown is ordered on purpose: stop the OpAMP client first (so
 ``agent_disconnect`` goes out), then deregister the extension (so the daemon
@@ -14,8 +19,9 @@ import logging
 import signal
 import sys
 import threading
-from typing import List, Optional
+from typing import Any, List, Optional
 
+from .configcache import ConfigCache, default_config_path
 from .extension import OsqueryExtension
 from .opamp.agent import DEFAULT_STATE_INTERVAL, OpampAgent
 from .opamp.client import OpampClient
@@ -25,8 +31,14 @@ from .opamp.constants import (
     MIN_RETRY_SECONDS,
 )
 from .opamp.identity import IdentityStore, default_identity_path
-from .opamp.transport import WebSocketTransport
+from .opamp.transport import transport_for_url
 from .osquery_thrift import default_manager_socket
+
+#: Where a local OpAMP server listens by default (opamp-server-py, opamp-go's
+#: example, the docker-compose in this repo's docs). Defaulted rather than
+#: required so that ``python -m osquery_opamp`` is a complete command against a
+#: stock server: plain HTTP works on any of them, and needs no server-side flag.
+DEFAULT_ENDPOINT = "http://localhost:4320/v1/opamp"
 
 #: How long a cold ``--config_plugin=opamp`` request waits for the first config.
 #: It delays daemon startup, so it is bounded and documented rather than infinite.
@@ -45,7 +57,14 @@ def build_parser() -> argparse.ArgumentParser:
         prog="osquery-opamp",
         description="OpAMP agent for osquery, delivered as an osquery extension.",
     )
-    parser.add_argument("--endpoint", required=True, help="OpAMP server URL (ws:// or wss://)")
+    parser.add_argument(
+        "--endpoint",
+        default=DEFAULT_ENDPOINT,
+        help=(
+            "OpAMP server URL: http(s):// for the request/reply transport, ws(s):// for"
+            " websocket (default: %(default)s)"
+        ),
+    )
     parser.add_argument(
         "--extensions-socket",
         default=default_manager_socket(),
@@ -58,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source", default=DEFAULT_SOURCE, help="osquery config source name")
     parser.add_argument(
+        "--config-cache",
+        default=str(default_config_path()),
+        help=(
+            "file holding the last config the daemon accepted, so a restart is served"
+            " it before the OpAMP server is reachable; pass an empty string to disable"
+            " it (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--heartbeat",
         type=float,
         default=DEFAULT_HEARTBEAT_SECONDS,
@@ -69,9 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=MIN_RETRY_SECONDS,
         help="initial reconnect delay in seconds; the spec recommends >= 30 (default: %(default)s)",
     )
-    parser.add_argument("--ca-file", default=None, help="CA bundle for wss:// verification")
+    parser.add_argument("--ca-file", default=None, help="CA bundle for https:// or wss:// verification")
     parser.add_argument(
-        "--tls-hostname", default=None, help="override the name verified against the certificate"
+        "--tls-hostname",
+        default=None,
+        help="wss:// only: override the name verified against the certificate",
     )
     parser.add_argument(
         "--header",
@@ -138,14 +168,36 @@ def main(argv: Optional[List[str]] = None) -> int:
             MIN_RETRY_SECONDS,
         )
 
+    if args.tls_hostname and args.endpoint.startswith(("http://", "https://")):
+        # Reported here rather than in the transport: the transport is built inside
+        # the client's reconnect loop, so raising there would log a traceback and
+        # retry forever instead of telling the operator what is wrong.
+        log.error(
+            "--tls-hostname is only supported for wss:// endpoints; over %s the"
+            " certificate must match the URL host",
+            args.endpoint.split(":", 1)[0],
+        )
+        return 2
+
     identity = IdentityStore(args.identity)
     uid = identity.load_or_create()
+
+    cache = ConfigCache(args.config_cache) if args.config_cache else None
+    if cache is None:
+        log.warning(
+            "no --config-cache: a restarted extension cannot serve the daemon its last"
+            " config, and a --config_plugin=opamp daemon will boot without one"
+            " unless --config_enable_backup restores it"
+        )
+    else:
+        log.info("config cache: %s", cache.path)
 
     extension = OsqueryExtension(
         args.extensions_socket,
         version=_version(),
         source=args.source,
         pull_wait=args.pull_wait,
+        config_cache=cache,
     )
     try:
         extension.start(wait=args.startup_timeout)
@@ -158,6 +210,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
+    pull_mode = _is_pull_mode(extension.core, args.source)
+    if pull_mode:
+        log.info(
+            "config mode: PULL - %r is the daemon's --config_plugin, so the daemon is"
+            " served config over genConfig and a restart is served %s",
+            args.source,
+            cache.path if cache is not None else "nothing (no --config-cache)",
+        )
+    else:
+        log.info(
+            "config mode: PUSH - the daemon runs its own --config_plugin; config is"
+            " merged as source %r via config/update and re-pushed after a restart",
+            args.source,
+        )
+
     agent = OpampAgent(
         uid,
         extension.core,
@@ -169,15 +236,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         sdk_version_source=extension.sdk_version_source,
         validate_queries=not args.no_validate_queries,
         state_interval=args.state_interval,
+        config_service=extension.service,
+        pull_mode=pull_mode,
     )
     client = OpampClient(
         agent,
-        lambda: WebSocketTransport(
+        lambda: transport_for_url(
             args.endpoint,
             headers=args.header,
             ca_file=args.ca_file,
             hostname=args.tls_hostname,
             timeout=max(args.heartbeat, 10.0),
+            instance_uid=lambda: agent.instance_uid,
         ),
         heartbeat_interval=args.heartbeat,
         retry_interval=args.retry,
@@ -217,6 +287,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         client.stop()
         extension.stop()
     return 0
+
+
+def _is_pull_mode(core: Any, source: str) -> bool:
+    """True when the daemon's active config plugin is us (``--config_plugin=opamp``).
+
+    This is the difference between "the daemon got its config from us" and "the
+    daemon has its own config and we merged a source into it", and it decides
+    whether the agent may adopt the cached ``config_hash`` at startup. A daemon that
+    cannot answer is assumed to be in push mode: re-delivering a config is cheap,
+    claiming one the daemon never loaded is not.
+    """
+    try:
+        return core.active_config_plugin().strip() == source
+    except Exception as exc:  # noqa: BLE001 - unknown is not pull
+        log.warning("could not read the daemon's config plugin (%s); assuming push mode", exc)
+        return False
 
 
 def _version() -> str:

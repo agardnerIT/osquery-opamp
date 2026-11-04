@@ -313,3 +313,126 @@ def test_server_config_hash_is_not_compared_to_a_body_hash():
     agent.handle(remote_config(body, config_hash=b"\x09" * 32))
     assert agent.next_message().remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED
     assert agent.last_remote_config_hash == b"\x09" * 32
+
+
+# ------------------------------------------------- durability (config cache)
+
+BODY_TEXT = '{"schedule": {"battery_stats": {"query": "SELECT percent_remaining FROM battery;", "interval": 30}}}'
+SERVER_HASH = bytes.fromhex("22aa53ff9c3b270753bf4cb01d23ccc7593fbf4e8436ccb4a516cbf35742d576")
+
+
+def service_with(tmp_path, *, body=BODY_TEXT, config_hash=SERVER_HASH.hex()):
+    """A real ExtensionService + ConfigCache, as the agent is given in production."""
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import ExtensionService
+
+    service = ExtensionService(ConfigCache(tmp_path / "config.json"))
+    service.agent_version = "0.1.0"
+    if body is not None:
+        service.set_config_body("opamp", body, config_hash=config_hash)
+    return service
+
+
+def test_pull_mode_adopts_the_cached_config_before_the_first_message(tmp_path):
+    """A restart must not look like a brand-new agent with no config."""
+    service_with(tmp_path)
+    # Simulate the process restart: same cache file, empty in-memory copy.
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import ExtensionService
+
+    restarted = ExtensionService(ConfigCache(tmp_path / "config.json"))
+    agent = make_agent(config_service=restarted, pull_mode=True)
+
+    message = agent.next_message()
+    assert message.remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED
+    assert bytes(message.remote_config_status.last_remote_config_hash) == SERVER_HASH, (
+        "the server correlates on this hash; reporting a different one re-delivers the config"
+    )
+    assert agent._applied_config == json.loads(BODY_TEXT)
+    # And the daemon is served the same bytes at boot, from disk.
+    assert restarted.cached_config("opamp") == BODY_TEXT
+
+
+def test_push_mode_does_not_claim_a_cached_config(tmp_path):
+    """With --config_plugin=filesystem the daemon re-read its file: UNSET is the truth."""
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import ExtensionService
+
+    service_with(tmp_path)
+    agent = make_agent(
+        config_service=ExtensionService(ConfigCache(tmp_path / "config.json")),
+        pull_mode=False,
+    )
+    message = agent.next_message()
+    assert not message.HasField("remote_config_status"), (
+        "push mode must not report APPLIED for a config the restarted daemon does not have"
+    )
+    assert agent.last_remote_config_hash == b""
+
+
+def test_an_applied_config_is_persisted_byte_for_byte_with_its_hash(tmp_path):
+    from osquery_opamp.configcache import ConfigCache
+
+    core = FakeCore()
+    agent = make_agent(
+        core,
+        config_service=service_with(tmp_path, body=None),
+        pull_mode=True,
+    )
+    agent.handle(remote_config(BODY_TEXT.encode(), config_hash=SERVER_HASH))
+
+    assert core.pushes == [("opamp", BODY_TEXT)], "the daemon gets the body, unchanged"
+    entry = ConfigCache(tmp_path / "config.json").load()
+    assert entry is not None
+    assert entry.body == BODY_TEXT
+    assert entry.config_hash == SERVER_HASH.hex()
+    assert entry.source == "opamp"
+    assert entry.content_type == "application/json"
+    assert entry.agent_version == "0.1.0"
+
+
+def test_a_rejected_config_is_never_cached(tmp_path):
+    agent = make_agent(
+        FakeCore(accept=False),
+        config_service=service_with(tmp_path, body=None),
+        pull_mode=True,
+    )
+    agent.handle(remote_config(b'{"schedule": []}', config_hash=SERVER_HASH))
+    assert agent.remote_config_status == opamp.RemoteConfigStatuses_FAILED
+    assert not (tmp_path / "config.json").exists(), (
+        "a config osquery rejected must not become the one served at the next boot"
+    )
+
+
+def test_a_reoffered_config_repairs_a_missing_cache(tmp_path):
+    """A daemon restored by --config_enable_backup still needs the cache written."""
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import ExtensionService
+
+    agent = make_agent(
+        FakeCore(),
+        config_service=ExtensionService(ConfigCache(tmp_path / "config.json")),
+        pull_mode=True,
+    )
+    # Already applied (e.g. restored from the daemon's own backup), no cache on disk.
+    agent.last_remote_config_hash = SERVER_HASH
+    agent.remote_config_status = opamp.RemoteConfigStatuses_APPLIED
+
+    agent.handle(remote_config(BODY_TEXT.encode(), config_hash=SERVER_HASH))
+    entry = ConfigCache(tmp_path / "config.json").load()
+    assert entry is not None and entry.body == BODY_TEXT
+    assert entry.config_hash == SERVER_HASH.hex()
+
+
+def test_persistence_failure_does_not_fail_the_apply(tmp_path):
+    """A full disk is a warning; the config is still applied and reported."""
+    class BrokenService:
+        def cached_entry(self):
+            return None
+
+        def set_config_body(self, *args, **kwargs):
+            raise OSError("disk full")
+
+    agent = make_agent(FakeCore(), config_service=BrokenService(), pull_mode=True)
+    agent.handle(remote_config(BODY_TEXT.encode(), config_hash=SERVER_HASH))
+    assert agent.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
