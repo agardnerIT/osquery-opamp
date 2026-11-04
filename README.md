@@ -8,7 +8,7 @@ registry calls that already exist:
 
 | OpAMP need | osquery mechanism |
 | --- | --- |
-| deliver remote config | `call("config", "update", ...)` → `Config::update()` merges a config source |
+| deliver remote config | `--config_plugin=opamp` → `genConfig` (persistent, the recommended mode); `call("config", "update", ...)` → `Config::update()` merges a config source (push mode) |
 | report what is actually running | `query("select ... from osquery_info / osquery_schedule")` |
 | answer `--config_plugin=opamp` (pull mode) | the `config/opamp` registry item we advertise |
 
@@ -23,11 +23,20 @@ osquery side
 - config hash / validity read-back, scheduled-query read-back
 - pull mode (`--config_plugin=opamp`), including a real daemon booting on a
   config served by `genConfig` - see "Pull mode" below
+- **config survives a restart.** The last accepted body and its OpAMP hash are
+  cached (`--config-cache`, `0600`, atomic). A restarted extension or daemon is
+  served it at boot, and in pull mode the agent re-reports `APPLIED` with the same
+  hash so the server neither re-delivers nor counts it as unconfirmed. Before
+  this, a daemon restart silently reverted the fleet to `--config_path`.
 - the same code path on Windows, where the extension API is a named pipe
 - concurrent RPC safety (one Thrift client, serialised - see below)
 
 OpAMP side (spec v0.20.0)
-- WebSocket transport, `wss://` with CA verification
+- both transports: plain HTTP (the default, works against any server) and
+  WebSocket, with `wss://`/`https://` CA verification. Chosen by the endpoint's
+  scheme, so pointing the agent at a server is one flag
+- gzip replies, and a bounded reply size before *and* after decompression
+- honours the server's `Retry-After` on 429/503 as a backoff floor
 - `AgentDescription` from `osquery_info`, honest capability bitmask
 - remote config → `config/update`, with `APPLYING`/`APPLIED`/`FAILED` status
 - pushed configs are **pre-compiled** before they are applied, so a schedule
@@ -50,19 +59,38 @@ Not implemented, and not advertised in the capability bitmask
   need one: the scheduler re-reads the merged schedule every tick, so an interval
   change takes effect on the next tick without restarting anything.
 - packages, `own_metrics`/`own_traces`/`own_logs`
-- connection settings (`ConnectionSettingsOffers`), plain-HTTP transport
+- connection settings (`ConnectionSettingsOffers`)
 - the *merged* config: no RPC exposes it, so sources are reported instead
 
 ## Run it
 
 ```bash
-.venv/bin/python -m osquery_opamp \
-    --endpoint wss://opamp.example.com/v1/opamp \
-    --extensions-socket /var/osquery/osquery.em \
-    --identity /var/lib/osquery-opamp/instance_uid \
-    --ca-file /etc/ssl/certs/ca-certificates.crt \
+sudo .venv/bin/python -m osquery_opamp \
     --header 'Authorization: Bearer <token>'
 ```
+
+That is the whole command: the endpoint defaults to
+`http://localhost:4320/v1/opamp`, and the osquery socket to the platform's
+default. Plain HTTP is the spec's request/reply transport and the one every
+OpAMP server answers without being configured, so it is the default here too.
+
+Point it elsewhere with `--endpoint`. The scheme picks the transport:
+
+```bash
+--endpoint http://opamp.internal:4320/v1/opamp    # poll/reply, any server
+--endpoint https://opamp.example.com/v1/opamp     # + --ca-file if not in the trust store
+--endpoint ws://opamp.internal:4320/v1/opamp      # server can push without waiting for a poll
+--endpoint wss://opamp.example.com/v1/opamp       # + --ca-file
+```
+
+WebSocket lowers delivery latency — a pushed config lands immediately instead of
+on the next heartbeat — but costs a server-side opt-in on servers that do not
+accept the upgrade by default. HTTP has no such requirement, which is why it is
+the default and why a `WRONG_VERSION_NUMBER`/403 on the upgrade is a sign to drop
+the `w` from the scheme rather than to start configuring the server.
+
+`--tls-hostname` is `wss://` only: over `https://` the certificate must match the
+URL host.
 
 Add `--enable-commands` to allow ad-hoc SQL, `--source` to change the osquery
 config source name, `--heartbeat`/`--retry` to tune timing, `--startup-timeout`
@@ -93,10 +121,37 @@ retry.) The extension retries registration for `--startup-timeout` seconds for
 the same reason: the daemon holds the manager socket open while it waits for us.
 
 With that in place the daemon asks for config once. `genConfig` answers from the
-configuration the OpAMP server most recently pushed, waiting up to `--pull-wait`
-seconds (default 10) for the first one to arrive. If none arrives, the extension
-returns a failure rather than an empty config, and the first push repairs the
-daemon without a restart.
+config cache - the body the daemon last accepted - so a boot does not wait for
+the OpAMP server and does not revert to `--config_path`. Only a completely cold
+start (no cache yet) waits, up to `--pull-wait` seconds (default 10); if nothing
+arrives the extension returns a failure rather than an empty config, and the
+first push repairs the daemon without a restart.
+
+Recommended daemon flags, because the cache only helps if nothing on the host
+fights with it:
+
+```bash
+osqueryd --config_plugin=opamp --extensions_require=opamp --extensions_timeout=30 \
+         --config_enable_backup=true
+```
+
+`--config_enable_backup` is osquery's own fallback: it copies config sources into
+the daemon's database and restores them if the first refresh of a process fails.
+Redundant while the cache answers, useful when the extension cannot start at all.
+
+### Restart behaviour
+
+| What restarts | Result |
+| --- | --- |
+| the extension | daemon keeps running with its config |
+| the daemon, pull mode | served from `--config-cache` at boot; `APPLIED` re-reported with the same hash |
+| the host, pull mode | same: the extension loads the cache and answers the boot-time `genConfig` |
+| the daemon, push mode (`--config_plugin=filesystem`) | **not** restored - the daemon re-reads its own file, the agent reports `UNSET`, the server re-delivers and the source is re-created |
+
+The mode is detected from the daemon and logged at startup (`config mode: PULL` /
+`config mode: PUSH`), because "a restart keeps the config" is true in only one
+of them. `--config-cache ''` disables persistence on hosts where a durable file
+is not wanted.
 
 ## Requirements
 
@@ -125,6 +180,7 @@ temporary paths, so they need no root and leave no state behind. Set
 
 ```
 src/osquery_opamp/osquery_thrift.py   vendored IDL loader, socket paths, client/server factories
+src/osquery_opamp/opamp/transport.py  HTTP and WebSocket transports, chosen by URL scheme
 src/osquery_opamp/winpipe.py          Windows named-pipe transport (client and server)
 src/osquery_opamp/core.py             typed wrapper over the daemon's registry calls
 src/osquery_opamp/extension.py        registration, liveness, Thrift Extension service

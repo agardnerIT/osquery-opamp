@@ -87,6 +87,7 @@ class OpampClient:
         backoff = self.retry_interval
         while not self._stop.is_set():
             transport = None
+            retry_after: Optional[float] = None
             try:
                 transport = self.transport_factory()
                 transport.connect()
@@ -108,6 +109,7 @@ class OpampClient:
                     backoff = self.retry_interval
             except TransportError as exc:
                 self.last_error = str(exc)
+                retry_after = exc.retry_after
                 log.warning("opamp transport error: %s", exc)
             except Exception as exc:  # noqa: BLE001 - never let the loop die
                 self.last_error = str(exc)
@@ -121,7 +123,7 @@ class OpampClient:
             if self._stop.is_set():
                 break
 
-            delay = self._next_delay(backoff)
+            delay = self._next_delay(backoff, retry_after)
             log.info("reconnecting in %.1fs", delay)
             self._stop.wait(delay)
             backoff = min(backoff * 2, self.max_retry_interval)
@@ -154,9 +156,19 @@ class OpampClient:
     def _send(self, transport: Transport, message: Any) -> None:
         transport.send(message.SerializeToString())
 
-    def _next_delay(self, base: float) -> float:
+    def _next_delay(self, base: float, retry_after: Optional[float] = None) -> float:
+        """Jittered backoff, never shorter than the server asked for.
+
+        ``retry_after`` is the server's own pacing (HTTP ``Retry-After`` on 429 or
+        503). It is a floor rather than a replacement: jitter still applies, so a
+        fleet shed at the same moment does not come back in lockstep, and the
+        exponential ceiling still applies to everything either side of it.
+        """
         spread = base * self.jitter
-        return max(MIN_RETRY_SECONDS * 0.0, base + self._rng.uniform(-spread, spread))
+        delay = max(0.0, base + self._rng.uniform(-spread, spread))
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        return delay
 
     def send_disconnect(self) -> None:
         """Best-effort ``agent_disconnect`` on a live connection."""
