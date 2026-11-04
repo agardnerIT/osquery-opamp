@@ -220,10 +220,14 @@ class OsqueryExtension:
         self._stopping.set()
         self.core.deregister(self.uuid)
         if self._server is not None:
+            # thriftpy2's TThreadedServer.close() only sets a flag; the serve
+            # loop is parked in accept() and will not notice until something
+            # connects. Without this poke, shutdown costs a full join timeout.
             try:
-                self._server.shutdown()
+                self._server.close()
             except Exception as exc:  # noqa: BLE001 - best effort
-                log.debug("server shutdown: %s", exc)
+                log.debug("server close: %s", exc)
+            self._poke_socket()
         if self.socket_path and os.path.exists(self.socket_path):
             try:
                 os.unlink(self.socket_path)
@@ -275,6 +279,24 @@ class OsqueryExtension:
 
     def request_stop(self) -> None:
         self._stopping.set()
+
+    @property
+    def shutdown_requested(self) -> bool:
+        """True once the daemon asked us to shut down (``Extension.shutdown``)."""
+        return self.service.shutdown_requested or self._stopping.is_set()
+
+    def _poke_socket(self) -> None:
+        """Connect once to the extension socket so accept() returns."""
+        import socket as _socket
+
+        if not self.socket_path:
+            return
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                sock.connect(self.socket_path)
+        except OSError as exc:
+            log.debug("socket poke failed (server may already be down): %s", exc)
 
     # -- convenience -------------------------------------------------------
 

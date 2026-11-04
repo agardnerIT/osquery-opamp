@@ -40,13 +40,24 @@ def find_osqueryd() -> str:
 
 
 class Daemon:
-    def __init__(self, root: Path, extensions_interval: int = 3) -> None:
+    def __init__(self, root: Path, extensions_interval: int = 1, watchdog: bool = False) -> None:
+        """Boot osqueryd.
+
+        ``watchdog=False`` is the default because the watcher/worker pair takes
+        ~5s to shut down and the extension-visible behaviour is identical. One
+        test runs with the watchdog on, so that topology stays covered.
+        """
         self.root = root
         self.socket = str(root / "osq.em")
         self.log_dir = root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         config_path = root / "config.json"
         config_path.write_text("{}\n")
+        # Redirect to a file, never a PIPE: a verbose daemon fills a 64 KiB pipe
+        # buffer, blocks on write, ignores SIGTERM and hangs teardown. The log is
+        # kept on disk so a failing test can still be diagnosed.
+        self.log_file = root / "osqueryd.log"
+        self._log_handle = open(self.log_file, "wb")
         self.process = subprocess.Popen(
             [
                 find_osqueryd(),
@@ -59,9 +70,10 @@ class Daemon:
                 "--logger_plugin=filesystem",
                 f"--logger_path={self.log_dir}",
                 "--disable_events=true",
+                *([] if watchdog else ["--disable_watchdog"]),
                 "--verbose",
             ],
-            stdout=subprocess.PIPE,
+            stdout=self._log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -72,8 +84,7 @@ class Daemon:
             if Path(self.socket).exists():
                 return
             if self.process.poll() is not None:
-                output = self.process.stdout.read().decode(errors="replace") if self.process.stdout else ""
-                raise RuntimeError(f"osqueryd exited early:\n{output}")
+                raise RuntimeError(f"osqueryd exited early; see {self.log_file}")
             time.sleep(0.1)
         raise TimeoutError(f"osqueryd did not create {self.socket} within {timeout}s")
 
@@ -90,6 +101,11 @@ class Daemon:
                     os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                self.process.wait(timeout=10)
+        try:
+            self._log_handle.close()
+        except OSError:
+            pass
 
 
 @pytest.fixture

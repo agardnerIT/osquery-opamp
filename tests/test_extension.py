@@ -133,3 +133,80 @@ def test_genconfig_serves_the_cached_config(extension, daemon):
     response = client.call("config", "opamp", {"action": "genConfig", "source": "opamp"})
     assert response.status.code == 0
     assert response.response and "opamp" in response.response[0]
+
+
+def test_extension_works_under_the_watchdog(tmp_path):
+    """The watcher/worker topology, which the rest of the suite skips for speed."""
+    import tempfile
+    from pathlib import Path
+
+    from conftest import Daemon
+    from osquery_opamp.extension import OsqueryExtension
+
+    root = Path(tempfile.mkdtemp(prefix="osq-wd-"))
+    daemon = Daemon(root, watchdog=True)
+    ext = None
+    try:
+        daemon.wait_for_socket()
+        ext = OsqueryExtension(daemon.socket, version="0.1.0")
+        ext.start()
+        assert ext.push_config(
+            "opamp", {"schedule": {"under_watcher": {"query": "select 1 from osquery_info;", "interval": 300}}}
+        ).ok
+        names = {row["name"] for row in ext.core.scheduled_queries()}
+        assert "under_watcher" in names
+        # The worker has a launcher process; the watcher column proves it.
+        assert ext.core.osquery_info().get("watcher", "-1") not in ("", "-1")
+    finally:
+        if ext is not None:
+            ext.stop()
+        daemon.stop()
+
+
+def test_core_client_is_safe_under_concurrent_rpcs(extension):
+    """Regression: an unlocked Thrift client silently lost config pushes.
+
+    The extension pings the daemon from its liveness thread while the OpAMP
+    thread pushes config. thriftpy2 clients own one socket and are not thread
+    safe, so without a lock the two interleave and responses are misattributed -
+    which looked like "the server's config was never applied".
+    """
+    import threading
+
+    errors = []
+    barrier = threading.Barrier(4)
+
+    def ping_worker():
+        barrier.wait()
+        for _ in range(25):
+            try:
+                assert extension.core.ping()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    def push_worker(source):
+        barrier.wait()
+        for i in range(10):
+            try:
+                result = extension.core.push_config(
+                    source, {"schedule": {f"{source}_{i}": {"query": "select 1 from osquery_info;", "interval": 300}}}
+                )
+                if not result.ok:
+                    errors.append(AssertionError(result.message))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(target=ping_worker),
+        threading.Thread(target=ping_worker),
+        threading.Thread(target=push_worker, args=("conc_a",)),
+        threading.Thread(target=push_worker, args=("conc_b",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not errors, f"concurrent RPCs failed: {errors[:3]}"
+    names = {row["name"] for row in extension.core.scheduled_queries()}
+    assert "conc_a_9" in names and "conc_b_9" in names, "a concurrent push was lost"

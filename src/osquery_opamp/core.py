@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -62,6 +63,12 @@ class CoreClient:
     def __init__(self, manager_socket: str, timeout_ms: int = 5000) -> None:
         self.manager_socket = manager_socket
         self._client = make_manager_client(manager_socket, timeout_ms=timeout_ms)
+        # One Thrift client owns one socket. The extension pings the daemon from
+        # its liveness thread while the OpAMP thread pushes config, so every RPC
+        # must be serialised or the two interleave on the wire and responses get
+        # mismatched with requests. This is not theoretical: it produced a
+        # silent "config never applied" before the lock existed.
+        self._lock = threading.RLock()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -75,7 +82,8 @@ class CoreClient:
     ) -> int:
         """Register this extension and return its route UUID."""
         info = self._info(name, version, sdk_version, min_sdk_version)
-        status: ExtensionStatus = self._client.registerExtension(info, registry)
+        with self._lock:
+            status: ExtensionStatus = self._client.registerExtension(info, registry)
         if status.code != EXT_SUCCESS:
             raise CoreError(f"registerExtension failed: {status.message}")
         if not status.uuid:
@@ -84,14 +92,16 @@ class CoreClient:
 
     def deregister(self, uuid: int) -> None:
         try:
-            self._client.deregisterExtension(uuid)
+            with self._lock:
+                self._client.deregisterExtension(uuid)
         except Exception as exc:  # noqa: BLE001 - best effort on shutdown
             log.debug("deregisterExtension(%s) failed: %s", uuid, exc)
 
     def ping(self) -> bool:
         """Ping the daemon. False means the daemon is gone."""
         try:
-            status: ExtensionStatus = self._client.ping()
+            with self._lock:
+                status: ExtensionStatus = self._client.ping()
         except Exception as exc:  # noqa: BLE001 - transport failures are expected
             log.debug("ping failed: %s", exc)
             return False
@@ -99,14 +109,16 @@ class CoreClient:
 
     def extensions(self) -> Dict[int, Any]:
         try:
-            return dict(self._client.extensions())
+            with self._lock:
+                return dict(self._client.extensions())
         except Exception as exc:  # noqa: BLE001
             log.debug("extensions() failed: %s", exc)
             return {}
 
     def options(self) -> Dict[str, Any]:
         try:
-            return dict(self._client.options())
+            with self._lock:
+                return dict(self._client.options())
         except Exception as exc:  # noqa: BLE001
             log.debug("options() failed: %s", exc)
             return {}
@@ -135,7 +147,8 @@ class CoreClient:
         """
         request = {"action": "update", "source": source, "data": payload}
         try:
-            response = self._client.call("config", "update", request)
+            with self._lock:
+                response = self._client.call("config", "update", request)
         except Exception as exc:  # noqa: BLE001
             return ConfigPushResult(False, f"transport error: {exc}")
 
@@ -148,7 +161,8 @@ class CoreClient:
     def query(self, sql: str) -> List[Dict[str, str]]:
         """Run ``sql`` in the daemon and return rows as dicts of strings."""
         try:
-            response = self._client.query(sql)
+            with self._lock:
+                response = self._client.query(sql)
         except Exception as exc:  # noqa: BLE001
             raise CoreError(f"query failed: {exc}") from exc
         if response.status.code != EXT_SUCCESS:
