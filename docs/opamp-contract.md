@@ -132,10 +132,35 @@ together with the server's `config_hash`.
 | What restarts | What happens | How it works |
 | --- | --- | --- |
 | the extension | daemon keeps running | nothing needed; the config is in the daemon already |
+| the extension (the daemon restarts under it) | re-registered and rebound automatically | see "Surviving a daemon restart" below |
 | the extension, then the daemon asks for config | served from disk | `genConfig` reads the cache before the OpAMP server is reachable |
 | the daemon (`--config_plugin=opamp`) | served from disk | the daemon's first `Config::refresh()` calls `genConfig`, which answers from the cache |
 | the daemon (`--config_plugin=filesystem`) | **not** restored | the daemon re-reads `--config_path`; the agent reports `UNSET` and the server re-delivers, which re-creates the source |
 | the host, `--config_plugin=opamp` | served from disk | the extension starts, loads the cache, and answers the daemon's boot-time `genConfig` |
+
+### Surviving a daemon restart
+
+A restart is the normal case, not a reason to exit, so the extension treats it that
+way: when the daemon answers a ping but no longer holds our route (or stops
+answering at all, twice), the extension unbinds its socket and registers again with
+backoff, for up to `reregister_wait` (default 300s), rebinding
+`<manager>.em.<new uuid>` and asking the agent to re-send full state.
+
+Two details were measured, not assumed:
+
+- **`ping()` alone cannot see a restart.** The manager answers immediately, with no
+  idea we exist, so a restart between two pings looks healthy. The route map is the
+  only question worth asking, which is why `CoreClient.is_registered()` exists.
+- **a clean daemon stop sends `Extension.shutdown()` to every extension.** Honouring
+  that as "exit" meant `osqueryctl restart` killed the agent, and a daemon started
+  with `--extensions_require=opamp` then had nothing to register and exited itself.
+  The request is now treated as a restart signal; only a signal to *us* (or a
+  re-registration timeout) stops the process.
+
+The same 300s is not a licence to leave a second copy running: while another process
+holds the `opamp` route the daemon keeps refusing, so after `--startup-timeout` the
+agent fails with the reason and the fix ("stop that process") instead of retrying
+forever.
 
 In pull mode the agent also re-adopts the cached `config_hash` at startup and
 reports `APPLIED` in its first message. That is not cosmetic: the spec's

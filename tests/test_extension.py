@@ -692,3 +692,255 @@ def test_a_restarted_daemon_is_served_the_cached_config(tmp_path):
     assert "from_cache" in names, (
         "the restarted daemon booted without the cached config; genConfig did not serve it"
     )
+
+
+# --------------------------------------- supervision: the daemon restarts
+
+class _FakeCore:
+    """Just enough CoreClient to drive registration and ping behaviour."""
+
+    def __init__(self, register=None, pings=None, on_exhausted=None, routes=None):
+        self.registered = 0
+        self.deregistered = []
+        self.pings = list(pings or [])
+        self._register = register
+        self._on_exhausted = on_exhausted
+        # None means "the daemon always knows us"; a list is the set of route uuids
+        # the fake daemon holds, so a restart can be simulated.
+        self.routes = routes
+
+    def register(self, **kwargs):
+        self.registered += 1
+        if callable(self._register):
+            return self._register(self.registered)
+        if isinstance(self._register, Exception):
+            raise self._register
+        return 1 if self._register is None else self._register
+
+    def deregister(self, uuid):
+        self.deregistered.append(uuid)
+
+    def ping(self):
+        if not self.pings:
+            if self._on_exhausted is not None:
+                self._on_exhausted()
+            return True
+        return self.pings.pop(0)
+
+    def is_registered(self, uuid):
+        if self.routes is None:
+            return True
+        return int(uuid) in self.routes
+
+    def active_config_plugin(self):
+        return ""
+
+
+def _extension(**kwargs):
+    from osquery_opamp.extension import OsqueryExtension
+
+    return OsqueryExtension("/tmp/does-not-exist.osq.em", sdk_version="5.24.0", **kwargs)
+
+
+def test_a_live_duplicate_fails_with_the_reason_and_the_fix():
+    """Twenty seconds of "retrying" then a bare exception is not a usable failure."""
+    import pytest as _pytest
+
+    from osquery_opamp.core import CoreError
+
+    ext = _extension()
+    ext.core = _FakeCore(register=RuntimeError("Duplicate extension registered"))
+    with _pytest.raises(CoreError) as caught:
+        ext._register(wait=0.3)
+    message = str(caught.value).lower()
+    assert "another copy" in message
+    assert "stop that process" in message
+
+
+def test_the_duplicate_wait_is_the_startup_budget():
+    """--startup-timeout has to cover both failure modes, or a restart loop is unexplainable."""
+    import pytest as _pytest
+    import time as _time
+
+    from osquery_opamp.core import CoreError
+
+    ext = _extension()
+    ext.core = _FakeCore(register=RuntimeError("Duplicate extension registered"))
+    started = _time.monotonic()
+    with _pytest.raises(CoreError):
+        ext._register(wait=0.6)
+    elapsed = _time.monotonic() - started
+    assert elapsed >= 0.6
+    assert elapsed < 5.0
+
+
+def test_registration_recovers_when_the_daemon_drops_the_old_route():
+    """A crashed previous process is a few seconds of duplicates, then success."""
+    ext = _extension()
+
+    def flaky(attempt):
+        if attempt <= 2:
+            raise RuntimeError("Duplicate extension registered")
+        return 42
+
+    ext.core = _FakeCore(register=flaky)
+    assert ext._register(wait=10) == 42
+    assert ext.core.registered == 3
+
+
+def _run_ping_loop(ext, pings, timeout: float = 5.0):
+    """Drive ``_ping_loop`` in a thread and stop it once the scripted answers run out.
+
+    Stopping the *thread* is not the daemon asking us to stop, which is exactly the
+    distinction these tests are about - hence ``request_stop`` on the extension
+    rather than the scripted ping consuming ``_stopping``.
+    """
+    import threading
+
+    done = threading.Event()
+    ext.core = _FakeCore(pings=pings, on_exhausted=done.set)
+    thread = threading.Thread(target=ext._ping_loop, daemon=True)
+    thread.start()
+    assert done.wait(timeout), "the ping loop never consumed the scripted answers"
+    ext.request_stop()
+    thread.join(timeout=5.0)
+
+
+def test_one_failed_ping_does_not_tear_down_a_registration():
+    """An RPC that timed out under load is not a dead daemon."""
+    ext = _extension(ping_interval=0.01)
+    calls = []
+    ext._reregister = lambda: calls.append(1) or True
+
+    _run_ping_loop(ext, [False, True, True])
+
+    assert calls == []
+    assert ext.service.shutdown_requested is False
+
+
+def test_two_failed_pings_reregister_instead_of_exiting():
+    ext = _extension(ping_interval=0.01)
+    calls = []
+    ext._reregister = lambda: (calls.append(1), True)[1]
+
+    _run_ping_loop(ext, [False, False])
+
+    assert calls == [1]
+    assert ext.service.shutdown_requested is False, "a restarted daemon is not a reason to exit"
+
+
+def test_a_daemon_that_dropped_our_route_triggers_reregistration():
+    """The restart a ping cannot see: new process, answering, no idea we exist."""
+    import threading
+
+    ext = _extension(ping_interval=0.01)
+    calls = []
+    ext._reregister = lambda: (calls.append(1), True)[1]
+    ext.uuid = 5000
+
+    done = threading.Event()
+    # The daemon answers every ping, but its route table is empty: this is what a
+    # restarted daemon looks like from here, and it is why ping() alone is not enough.
+    ext.core = _FakeCore(pings=[True, True], on_exhausted=done.set, routes=set())
+    assert ext._daemon_knows_us() is False
+
+    thread = threading.Thread(target=ext._ping_loop, daemon=True)
+    thread.start()
+    assert done.wait(5.0)
+    ext.request_stop()
+    thread.join(timeout=5.0)
+
+    assert calls, "an answering daemon without our route is a restarted daemon"
+
+
+def test_a_failed_reregistration_finally_stops_the_extension():
+    """If the daemon never comes back, exiting is the honest end state."""
+    ext = _extension(ping_interval=0.01)
+    ext._reregister = lambda: False
+    ext.core = _FakeCore(pings=[False, False])
+
+    ext._ping_loop()
+
+    assert ext.shutdown_requested is True
+
+
+def test_reregister_rebinds_the_new_uuid_and_asks_for_full_state(monkeypatch):
+    """The old socket path is dead once the uuid changes; serving it is a silent loss."""
+    import osquery_opamp.extension as extension_module
+
+    class Server:
+        def serve(self):
+            return
+
+        def close(self):
+            return
+
+    monkeypatch.setattr(extension_module, "make_extension_server", lambda path, service: Server())
+    monkeypatch.setattr(extension_module, "poke_extension_socket", lambda path: None)
+    monkeypatch.setattr(extension_module, "close_extension_socket", lambda path: None)
+
+    ext = _extension()
+    ext.core = _FakeCore(register=777)
+    state = []
+    ext.on_reregistered = lambda: state.append("full state")
+
+    assert ext._reregister() is True
+    assert ext.uuid == 777
+    assert ext.service.uuid == 777, "answers must carry the uuid the daemon now knows us by"
+    assert ext.socket_path.endswith(".777")
+    assert state == ["full state"]
+
+
+def test_the_extension_reregisters_after_a_daemon_restart(tmp_path):
+    """The real thing: a daemon restart must not take the agent with it.
+
+    Before this, the first failed ping called ``request_stop()``, so
+    ``osqueryctl restart`` killed the agent - and a daemon started with
+    ``--extensions_require=opamp`` then exited because nothing registered. With the
+    restart below there is no re-launch and no re-push: the same process has to
+    notice, re-register and rebind its socket.
+    """
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from conftest import Daemon
+    from osquery_opamp.extension import OsqueryExtension
+    from osquery_opamp.osquery_thrift import make_manager_client
+
+    root = Path(tempfile.mkdtemp(prefix="osq-rereg-"))
+    socket_path = root / "osq.em"
+    first_uuid = 0
+    ext = None
+    second = None
+    try:
+        first = Daemon(root)
+        first.wait_for_socket()
+        ext = OsqueryExtension(first.socket, version="0.1.0", ping_interval=0.3)
+        ext.start()
+        first_uuid = ext.uuid
+
+        first.stop()
+        socket_path.unlink(missing_ok=True)
+
+        second = Daemon(root)
+        second.wait_for_socket()
+
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline:
+            if ext.uuid != first_uuid and ext.core.is_registered(ext.uuid):
+                break
+            time.sleep(0.2)
+
+        assert ext.uuid != first_uuid, "the extension kept the uuid of the daemon that died"
+        assert ext.service.uuid == ext.uuid
+        assert ext.shutdown_requested is False
+        assert ext.uuid in dict(make_manager_client(second.socket).extensions())
+    finally:
+        if ext is not None:
+            try:
+                ext.stop()
+            except Exception:
+                pass
+        if second is not None:
+            second.stop()

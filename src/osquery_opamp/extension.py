@@ -21,7 +21,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from .configcache import CachedConfig, ConfigCache
-from .core import CoreClient
+from .core import CoreClient, CoreError
 from .osquery_thrift import (
     EXT_FAILED,
     EXT_SUCCESS,
@@ -42,6 +42,11 @@ log = logging.getLogger(__name__)
 DEFAULT_REGISTRY: Dict[str, Dict[str, List[Dict[str, str]]]] = {
     "config": {EXTENSION_NAME: []}
 }
+
+#: How many consecutive failed pings mean "the daemon is gone", not "one RPC
+#: timed out". The daemon itself drops us after two missed pings, so one is too
+#: trigger-happy and three is slower than the daemon's own timeout.
+PING_FAILURES_BEFORE_REREGISTER = 2
 
 
 class ExtensionService:
@@ -285,6 +290,7 @@ class OsqueryExtension:
         source: str = EXTENSION_NAME,
         pull_wait: float = 0.0,
         config_cache: Optional[ConfigCache] = None,
+        reregister_wait: float = 300.0,
     ) -> None:
         self.manager_socket = manager_socket
         self.name = name
@@ -309,10 +315,25 @@ class OsqueryExtension:
         self.uuid: int = 0
         self.socket_path: str = ""
 
+        #: How long to keep trying to register again after the daemon restarts.
+        #: A restart drops the registration, and a deployment with
+        #: ``--extensions_require=opamp`` needs this process back before the daemon
+        #: gives up and exits - so "retry" is the correct answer to a dead daemon,
+        #: not "shut down".
+        self.reregister_wait = reregister_wait
+        #: Called after a successful re-registration (the agent uses it to re-send
+        #: full state, so the server sees the new daemon's truth immediately).
+        self.on_reregistered: Optional[Callable[[], None]] = None
+        self._ping_failures = 0
+
         self._server: Any = None
         self._server_thread: Optional[threading.Thread] = None
+        self._server_lock = threading.Lock()
         self._ping_thread: Optional[threading.Thread] = None
         self._stopping = threading.Event()
+        # The daemon's own "please shut down" is a restart signal, not a decision
+        # to exit: see _note_daemon_shutdown.
+        self.service.on_shutdown = self._note_daemon_shutdown
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -322,27 +343,18 @@ class OsqueryExtension:
         Returns the route UUID. Raises ``CoreError`` if the daemon refuses the
         registration (usually a duplicate extension name).
 
-        ``wait`` retries the registration until the daemon's socket appears,
-        which is what a ``--extensions_require=opamp`` deployment needs: the
-        daemon binds the manager socket and waits for us, while we may already
-        be running and finding nothing to connect to.
+        ``wait`` is one budget for both ways registration can fail, because both
+        have the same answer - keep trying:
+
+        * the manager socket is not there yet: the daemon may still be starting, or
+          it is waiting for us via ``--extensions_require``;
+        * the daemon still has a route for this name, held by a previous process
+          that is either dead (dropped after two missed pings) or **still running**.
+          The second case can never succeed, so the budget doubles as the time limit
+          for telling the operator to stop the other copy.
         """
         self.uuid = self._register(wait)
-        self.service.uuid = self.uuid
-        self.socket_path = extension_socket_path(self.manager_socket, self.uuid)
-        log.info(
-            "registered extension %s (uuid=%s, sdk=%s) at %s",
-            self.name,
-            self.uuid,
-            self.sdk_version,
-            self.socket_path,
-        )
-
-        self._server = make_extension_server(self.socket_path, self.service)
-        self._server_thread = threading.Thread(
-            target=self._serve, name="osquery-extension-server", daemon=True
-        )
-        self._server_thread.start()
+        self._bind_server()
 
         if wait_for_ping:
             self._await_first_ping()
@@ -353,22 +365,59 @@ class OsqueryExtension:
         self._ping_thread.start()
         return self.uuid
 
-    def _register(self, wait: float, duplicate_wait: float = 20.0) -> int:
+    def _bind_server(self) -> None:
+        """Serve the ``Extension`` service at ``<manager>.em.<uuid>``.
+
+        Separated from :meth:`start` because a daemon restart gives us a **new**
+        uuid and therefore a new socket path: re-registration has to rebind, not
+        just remember a number.
+        """
+        with self._server_lock:
+            self.service.uuid = self.uuid
+            self.socket_path = extension_socket_path(self.manager_socket, self.uuid)
+            self._server = make_extension_server(self.socket_path, self.service)
+            self._server_thread = threading.Thread(
+                target=self._serve, name="osquery-extension-server", daemon=True
+            )
+            self._server_thread.start()
+        log.info(
+            "registered extension %s (uuid=%s, sdk=%s) at %s",
+            self.name,
+            self.uuid,
+            self.sdk_version,
+            self.socket_path,
+        )
+
+    def _unbind_server(self, timeout: float = 5.0) -> None:
+        """Stop serving, and remove the socket so a new uuid can be bound."""
+        with self._server_lock:
+            server, thread, path = self._server, self._server_thread, self.socket_path
+            self._server = None
+            self._server_thread = None
+        if server is not None:
+            # thriftpy2's TThreadedServer.close() only sets a flag; the serve
+            # loop is parked in accept() and will not notice until something
+            # connects. Without this poke, shutdown costs a full join timeout.
+            try:
+                server.close()
+            except Exception as exc:  # noqa: BLE001 - best effort
+                log.debug("server close: %s", exc)
+            poke_extension_socket(path)
+        close_extension_socket(path)
+        if thread is not None:
+            thread.join(timeout=timeout)
+
+    def _register(self, wait: float, duplicate_wait: Optional[float] = None) -> int:
         """Register with the daemon, retrying transient failures.
 
-        Two different waits, because the two failures have different causes:
-
-        * the manager socket is not there yet (``wait``) - the daemon may still be
-          starting, or it is waiting for us via ``--extensions_require``;
-        * the daemon still holds a route for this extension name
-          (``duplicate_wait``) - a crashed or restarted process. The daemon drops
-          the stale route only after two failed pings
-          (``ExtensionManagerWatcher::watch``), so a replacement process is
-          refused for a few seconds. Retrying this is what makes a supervisor
-          restart work without a human.
+        One deadline for both failure modes (see :meth:`start`). A duplicate is not
+        retried forever: while the other process is alive the daemon will keep
+        refusing, and a boot loop that never says why is worse than a failure that
+        names the cause.
         """
         deadline = time.monotonic() + wait
-        duplicate_deadline = time.monotonic() + duplicate_wait
+        duplicate_deadline = time.monotonic() + (wait if duplicate_wait is None else duplicate_wait)
+        duplicate_seen = False
         while True:
             self._resolve_sdk_version()
             try:
@@ -382,8 +431,16 @@ class OsqueryExtension:
             except Exception as exc:  # noqa: BLE001 - socket may not exist yet
                 now = time.monotonic()
                 if "duplicate" in str(exc).lower():
+                    duplicate_seen = True
                     if now >= duplicate_deadline:
-                        raise
+                        raise CoreError(
+                            f"cannot register extension {self.name!r}: the daemon still "
+                            f"has a registration for it after {wait:g}s. Another copy of "
+                            "this extension is running and still answering the daemon's "
+                            "pings - stop that process (the daemon drops a dead one after "
+                            "two missed pings, so a crash recovers on its own and a live "
+                            "duplicate never does)"
+                        ) from exc
                     log.info(
                         "daemon still holds a registration for %r; retrying in 0.5s",
                         self.name,
@@ -401,6 +458,13 @@ class OsqueryExtension:
                     "SDK version %s",
                     MIN_SDK_VERSION,
                 )
+            if duplicate_seen:
+                # Worth a line: it means a previous copy of this extension was still
+                # registered when we started, which is how a botched upgrade looks.
+                log.info(
+                    "registered %r after the daemon dropped the previous route",
+                    self.name,
+                )
             return uuid
 
     def _resolve_sdk_version(self) -> None:
@@ -417,19 +481,10 @@ class OsqueryExtension:
             return
         self._stopping.set()
         self.core.deregister(self.uuid)
-        if self._server is not None:
-            # thriftpy2's TThreadedServer.close() only sets a flag; the serve
-            # loop is parked in accept() and will not notice until something
-            # connects. Without this poke, shutdown costs a full join timeout.
-            try:
-                self._server.close()
-            except Exception as exc:  # noqa: BLE001 - best effort
-                log.debug("server close: %s", exc)
-            poke_extension_socket(self.socket_path)
-        close_extension_socket(self.socket_path)
-        for thread in (self._ping_thread, self._server_thread):
-            if thread is not None:
-                thread.join(timeout=timeout)
+        self._unbind_server(timeout=timeout)
+        # The ping thread may be parked in _reregister(); _stopping breaks it out.
+        if self._ping_thread is not None:
+            self._ping_thread.join(timeout=timeout)
         log.info("extension stopped (uuid=%s)", self.uuid)
 
     # -- threads -----------------------------------------------------------
@@ -442,17 +497,121 @@ class OsqueryExtension:
                 log.exception("extension server failed")
 
     def _ping_loop(self) -> None:
-        """Ping the daemon; stop if it disappears.
+        """Ping the daemon; re-register when it restarts.
 
-        The daemon pings *us* for liveness; this loop is the other direction, and
-        exists so the extension notices a restarted daemon instead of holding a
-        stale registration.
+        The daemon pings *us* for liveness; this loop is the other direction. When
+        it fails, the daemon is usually restarting rather than gone for good - and in
+        a deployment using ``--extensions_require=opamp`` this process exiting is
+        precisely what makes the daemon give up and exit too. So a dead daemon means
+        "register again", not "shut down".
+
+        One failed ping is not enough: an RPC that timed out under load, or a restart
+        we called the ping in the middle of, must not tear down a healthy
+        registration.
         """
         while not self._stopping.wait(self.ping_interval):
-            if not self.core.ping():
-                log.warning("osquery daemon is not responding; stopping extension")
+            if self._daemon_knows_us():
+                self._ping_failures = 0
+                continue
+            self._ping_failures += 1
+            if self._ping_failures < PING_FAILURES_BEFORE_REREGISTER:
+                log.warning(
+                    "osquery daemon did not answer a ping (failure %d/%d)",
+                    self._ping_failures,
+                    PING_FAILURES_BEFORE_REREGISTER,
+                )
+                continue
+            log.warning(
+                "osquery daemon is gone; re-registering (a restart is the normal "
+                "case, and the daemon needs this extension back if it requires it)"
+            )
+            if not self._reregister():
+                log.error(
+                    "could not re-register with osqueryd within %.0fs; stopping extension",
+                    self.reregister_wait,
+                )
                 self.request_stop()
                 return
+
+    def _daemon_knows_us(self) -> bool:
+        """Is the daemon still there **and** still holding our registration?
+
+        Both halves matter. A daemon that answers ``ping()`` but no longer has our
+        route is a daemon that just restarted, and that is the common case of all:
+        ``osqueryctl restart`` finishes in about a second, so the next ping succeeds
+        against the new process while the old route is gone for good. Checking only
+        the ping leaves the extension silently unregistered until the daemon's own
+        watcher gives up on the socket nobody serves.
+        """
+        if not self.core.ping():
+            return False
+        knows = getattr(self.core, "is_registered", None)
+        if knows is None:  # a core that cannot answer is not evidence of a problem
+            return True
+        try:
+            return bool(knows(self.uuid))
+        except Exception as exc:  # noqa: BLE001 - counted as a failure and retried
+            log.debug("could not read the daemon's extension list: %s", exc)
+            return False
+
+    def _reregister(self) -> bool:
+        """Re-register after a daemon restart, rebinding the extension socket.
+
+        The old route is gone with the old daemon, so a successful ``register``
+        returns a **new** uuid and the service has to move to
+        ``<manager>.em.<new uuid>``: keeping the old one would leave the daemon
+        pinging a socket nobody serves and dropping us two intervals later.
+
+        ``register`` failing while the route is still held is expected for a few
+        seconds in the other direction (the daemon restarted but the route survived),
+        and while *our own* previous route is still live, so the loop backs off
+        instead of giving up.
+        """
+        self._unbind_server()
+        deadline = time.monotonic() + self.reregister_wait
+        delay = 0.5
+        attempt = 0
+        while not self._stopping.is_set():
+            if time.monotonic() >= deadline:
+                return False
+            attempt += 1
+            self._resolve_sdk_version()
+            try:
+                uuid = self.core.register(
+                    name=self.name,
+                    version=self.version,
+                    sdk_version=self.sdk_version,
+                    min_sdk_version=self.min_sdk_version,
+                    registry=self.registry,
+                )
+            except Exception as exc:  # noqa: BLE001 - daemon may still be coming up
+                log.debug(
+                    "re-registration attempt %d failed (%s); retrying in %.1fs",
+                    attempt,
+                    exc,
+                    delay,
+                )
+                if self._stopping.wait(delay):
+                    return False
+                delay = min(delay * 2, 10.0)
+                continue
+
+            self.uuid = uuid
+            self._ping_failures = 0
+            self._bind_server()
+            log.info(
+                "re-registered %s as uuid=%s at %s after the daemon restarted",
+                self.name,
+                uuid,
+                self.socket_path,
+            )
+            if self.on_reregistered is not None:
+                try:
+                    self.on_reregistered()
+                except Exception as exc:  # noqa: BLE001 - never undo a registration
+                    log.warning("re-register callback failed: %s", exc)
+            return True
+        return False
 
     def _await_first_ping(self, timeout: float = 15.0) -> None:
         """Block until the daemon has actually pinged our socket.
@@ -474,10 +633,38 @@ class OsqueryExtension:
     def request_stop(self) -> None:
         self._stopping.set()
 
+    def _note_daemon_shutdown(self) -> None:
+        """The daemon is going away. Treat it as a restart, not as an exit.
+
+        osquery sends ``Extension.shutdown()`` to every registered extension as part
+        of its own shutdown, so a clean ``osqueryctl restart`` would otherwise take
+        the agent down with it - and a deployment with ``--extensions_require=opamp``
+        then has a daemon exiting because nothing registered. Prompting the
+        supervisor to act on the next tick is better than waiting for two failed
+        pings, and much better than exiting.
+
+        If the daemon never comes back, :meth:`_reregister` gives up after
+        ``reregister_wait`` and the extension stops, which is the honest end state.
+        """
+        if self._stopping.is_set():
+            return
+        log.warning(
+            "osqueryd asked the extension to shut down (a restart, normally); "
+            "staying up so the daemon finds its config plugin when it returns"
+        )
+        self._ping_failures = PING_FAILURES_BEFORE_REREGISTER
+
     @property
     def shutdown_requested(self) -> bool:
-        """True once the daemon asked us to shut down (``Extension.shutdown``)."""
-        return self.service.shutdown_requested or self._stopping.is_set()
+        """True once *this* process has decided to stop.
+
+        Deliberately not the daemon's ``Extension.shutdown()``: that arrives on every
+        ordinary ``osqueryctl restart``, and exiting on it is what left a
+        ``--extensions_require`` daemon with no config plugin. :attr:`_stopping` is
+        set by a signal, by :meth:`request_stop`, or by a re-registration that ran out
+        of time.
+        """
+        return self._stopping.is_set()
 
     def _poke_socket(self) -> None:
         """Kept for callers; delegates to the platform-aware poke."""

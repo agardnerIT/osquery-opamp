@@ -188,6 +188,16 @@ class CoreClient:
             log.debug("extensions() failed: %s", exc)
             return {}
 
+    def is_registered(self, uuid: int) -> bool:
+        """Whether the daemon still knows this extension's route.
+
+        ``ping()`` only proves *a* daemon is answering, so it cannot tell that the
+        daemon was restarted underneath us: the new process answers immediately and
+        has no idea we exist. The route map can, and "am I still registered" is the
+        question the supervisor actually needs answered.
+        """
+        return int(uuid) in self.extensions()
+
     def options(self) -> Dict[str, Any]:
         try:
             return dict(self._rpc(lambda c: c.options()))

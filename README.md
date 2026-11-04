@@ -144,13 +144,22 @@ Redundant while the cache answers, useful when the extension cannot start at all
 | What restarts | Result |
 | --- | --- |
 | the extension | daemon keeps running with its config |
-| the daemon, pull mode | served from `--config-cache` at boot; `APPLIED` re-reported with the same hash |
+| the daemon, extension still up | re-registers with a new uuid and rebinds; no relaunch needed |
 | the host, pull mode | same: the extension loads the cache and answers the boot-time `genConfig` |
 | the daemon, push mode (`--config_plugin=filesystem`) | **not** restored - the daemon re-reads its own file, the agent reports `UNSET`, the server re-delivers and the source is re-created |
 
 The mode is detected from the daemon and logged at startup (`config mode: PULL` /
 `config mode: PUSH`), because "a restart keeps the config" is true in only one
-of them. `--config-cache ''` disables persistence on hosts where a durable file
+of them.
+
+The extension is supervised the same way: a daemon restart (including the
+`Extension.shutdown()` that a clean `osqueryctl restart` sends) makes it re-register
+in a loop with backoff rather than exit, so a daemon with
+`--extensions_require=opamp` always finds its config plugin. Only a signal to the
+agent itself, or 300s of the daemon not coming back, stops it. A second copy of the
+agent is a different matter: the daemon refuses duplicates while the first is
+answering pings, so the agent fails after `--startup-timeout` with the reason and
+the fix rather than looping. `--config-cache ''` disables persistence on hosts where a durable file
 is not wanted.
 
 ## Requirements

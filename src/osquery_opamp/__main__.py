@@ -124,8 +124,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_STARTUP_TIMEOUT_SECONDS,
         help=(
-            "seconds to retry registering with osqueryd before giving up; raise it"
-            " when osqueryd uses --extensions_require (default: %(default)s)"
+            "seconds to retry registering with osqueryd before giving up, covering both"
+            " a daemon that is still starting and a previous copy of this extension that"
+            " is still registered; raise it when osqueryd uses --extensions_require"
+            " (default: %(default)s)"
         ),
     )
     parser.add_argument(
@@ -239,6 +241,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         config_service=extension.service,
         pull_mode=pull_mode,
     )
+    # A restarted daemon is a new process with no state: after we register again,
+    # tell the server everything (description, health, effective config, status) so
+    # its view of the daemon matches the one that just booted, not the dead one.
+    extension.on_reregistered = agent.request_full_state
     client = OpampClient(
         agent,
         lambda: transport_for_url(
