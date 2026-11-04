@@ -51,7 +51,7 @@ def wired(extension):
 
 
 def test_remote_config_lands_in_the_running_daemon(wired, extension):
-    server, agent, _ = wired
+    server, _agent, _ = wired
     server.push_config(
         {"schedule": {"e2e_pushed": {"query": "select 1 as n from osquery_info;", "interval": 300}}}
     )
@@ -66,7 +66,7 @@ def test_remote_config_lands_in_the_running_daemon(wired, extension):
 
 
 def test_rejected_config_is_reported_failed_with_the_daemon_error(wired):
-    server, agent, _ = wired
+    server, _agent, _ = wired
     server.push_raw_config(b"{definitely not json")
 
     message = server.wait_for(
@@ -89,7 +89,7 @@ def test_agent_description_reaches_the_server(wired):
 
 
 def test_heartbeats_keep_the_stream_alive(wired):
-    server, agent, _ = wired
+    server, _agent, _ = wired
     server.wait_for(lambda m: m.sequence_num >= 3, description="three messages")
     sequences = [m.sequence_num for m in server.messages()]
     assert sequences == sorted(sequences)
@@ -97,7 +97,7 @@ def test_heartbeats_keep_the_stream_alive(wired):
 
 
 def test_server_can_request_full_state(wired):
-    server, agent, _ = wired
+    server, _agent, _ = wired
     server.wait_for(lambda m: m.HasField("agent_description"))
     server.clear()
     server.request_full_state()
@@ -108,7 +108,7 @@ def test_server_can_request_full_state(wired):
 
 
 def test_effective_config_is_reported_when_accepted(wired):
-    server, agent, _ = wired
+    server, _agent, _ = wired
     server.push_config({"schedule": {"x": {"query": "select 1 from osquery_info;", "interval": 300}}})
     server.wait_for(lambda m: m.remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED)
 
@@ -123,7 +123,7 @@ def test_effective_config_is_reported_when_accepted(wired):
 
 def test_adhoc_query_returns_rows_from_the_daemon(extension):
     with FakeOpampServer() as server:
-        agent, client = build_client(server, extension.core, commands_enabled=True)
+        _agent, client = build_client(server, extension.core, commands_enabled=True)
         client.start()
         server.wait_for_connection()
 
@@ -144,7 +144,7 @@ def test_adhoc_query_returns_rows_from_the_daemon(extension):
 
 
 def test_client_reconnects_after_the_server_drops_it(wired):
-    server, agent, client = wired
+    server, _agent, _client = wired
     first = server.wait_for(lambda m: m.sequence_num >= 1, description="first message")
     last_sequence = first.sequence_num
     server.drop_connection()

@@ -111,7 +111,7 @@ class OpampClient:
                 log.warning("opamp transport error: %s", exc)
             except Exception as exc:  # noqa: BLE001 - never let the loop die
                 self.last_error = str(exc)
-                log.exception("unexpected error in opamp client: %s", exc)
+                log.exception("unexpected error in opamp client")
             finally:
                 self.connected.clear()
                 if transport is not None:

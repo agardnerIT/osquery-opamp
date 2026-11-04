@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 
 
 def test_extension_registers_and_is_visible(extension, daemon):
@@ -122,7 +121,9 @@ def test_genconfig_serves_the_cached_config(extension, daemon):
     client = make_manager_client(daemon.socket)
 
     # Before any config is pushed the plugin must fail cleanly, so osquery falls
-    # back to its own handling instead of loading an empty config silently.
+    # back to its own handling instead of loading an empty config silently. The
+    # fixture runs with pull_wait=0 to keep this immediate; the waiting
+    # behaviour gets its own test below.
     response = client.call(
         "config", "opamp", {"action": "genConfig", "source": "opamp"}
     )
@@ -133,6 +134,135 @@ def test_genconfig_serves_the_cached_config(extension, daemon):
     response = client.call("config", "opamp", {"action": "genConfig", "source": "opamp"})
     assert response.status.code == 0
     assert response.response and "opamp" in response.response[0]
+
+
+def test_genconfig_answers_a_request_with_no_source(extension, daemon):
+    """osquery sends no ``source`` when this extension is the active config plugin.
+
+    ``Config::refresh()`` calls ``Registry::call("config", {{"action",
+    "genConfig"}})`` - there is no source key - so the extension has to know
+    which source it serves.
+    """
+    from osquery_opamp.osquery_thrift import make_manager_client
+
+    extension.push_config("opamp", {"schedule": {"sourceless": {"query": "select 1 from osquery_info;", "interval": 300}}})
+
+    response = make_manager_client(daemon.socket).call("config", "opamp", {"action": "genConfig"})
+    assert response.status.code == 0
+    assert "sourceless" in response.response[0]["opamp"]
+
+
+def test_genconfig_waits_for_a_config_that_is_still_in_flight(daemon):
+    """A cold daemon must not fail just because OpAMP is 300ms behind.
+
+    This is the race ``--config_plugin=opamp`` actually loses: osquery asks for
+    config during its own initialisation, while the OpAMP round-trip is still in
+    progress.
+    """
+    import threading
+    import time
+
+    from osquery_opamp.extension import OsqueryExtension
+    from osquery_opamp.osquery_thrift import make_manager_client
+
+    ext = OsqueryExtension(daemon.socket, version="0.1.0", pull_wait=5.0)
+    ext.start()
+    try:
+        timer = threading.Timer(
+            0.3,
+            lambda: ext.service.set_config(
+                "opamp", {"schedule": {"late": {"query": "select 1 from osquery_info;", "interval": 300}}}
+            ),
+        )
+        timer.start()
+
+        started = time.monotonic()
+        response = make_manager_client(daemon.socket).call(
+            "config", "opamp", {"action": "genConfig", "source": "opamp"}
+        )
+        waited = time.monotonic() - started
+    finally:
+        ext.stop()
+
+    assert response.status.code == 0
+    assert "late" in response.response[0]["opamp"]
+    assert 0.2 <= waited < 5.0, f"genConfig returned after {waited:.2f}s; the wait did not happen"
+
+
+def test_genconfig_gives_up_after_the_wait(daemon):
+    """Bounded, not infinite: a daemon start must not hang on a dead OpAMP server."""
+    import time
+
+    from osquery_opamp.extension import OsqueryExtension
+    from osquery_opamp.osquery_thrift import EXT_FAILED, make_manager_client
+
+    ext = OsqueryExtension(daemon.socket, version="0.1.0", pull_wait=0.3)
+    ext.start()
+    try:
+        started = time.monotonic()
+        response = make_manager_client(daemon.socket).call(
+            "config", "opamp", {"action": "genConfig", "source": "opamp"}
+        )
+        waited = time.monotonic() - started
+    finally:
+        ext.stop()
+
+    assert response.status.code == EXT_FAILED
+    assert "waited" in response.status.message
+    assert waited >= 0.25
+
+
+def test_config_plugin_opamp_serves_the_schedule_at_boot(tmp_path):
+    """End to end: `osqueryd --config_plugin=opamp` gets its config from us.
+
+    osquery resolves the active config plugin before it loads configuration, so
+    the extension must be registered by then. `--extensions_require` makes the
+    daemon wait inside `startExtensionManager()`, which runs first.
+
+    Without it this is not a degraded mode, it is a dead daemon. Measured on
+    5.24.0: `initActivePlugin("config", "opamp")` fails with "Cannot activate
+    opamp config plugin: Unknown registry plugin: opamp", `requestShutdown` is
+    called, and osqueryd exits before it ever loads a config. `--config_refresh`
+    defaults to 0, so even a daemon that survived would not retry.
+    """
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from conftest import Daemon
+    from osquery_opamp.extension import OsqueryExtension
+
+    root = Path(tempfile.mkdtemp(prefix="osq-pull-"))
+    daemon = Daemon(
+        root,
+        config_plugin="opamp",
+        extensions_require="opamp",
+        extensions_timeout="30",
+    )
+    ext = None
+    try:
+        ext = OsqueryExtension(daemon.socket, version="0.1.0", pull_wait=20.0)
+        # Simulate OpAMP delivering config before osqueryd finishes booting. No
+        # push: the only way this config can reach the daemon is genConfig.
+        ext.service.set_config(
+            "opamp",
+            {"schedule": {"pulled": {"query": "select 1 as n from osquery_info;", "interval": 300}}},
+        )
+        ext.start(wait=25.0)
+
+        deadline = time.monotonic() + 20.0
+        names = set()
+        while time.monotonic() < deadline:
+            names = {row["name"] for row in ext.core.scheduled_queries()}
+            if "pulled" in names:
+                break
+            time.sleep(0.2)
+    finally:
+        if ext is not None:
+            ext.stop()
+        daemon.stop()
+
+    assert "pulled" in names, "osqueryd booted without the config served by genConfig"
 
 
 def test_extension_works_under_the_watchdog(tmp_path):
@@ -210,3 +340,50 @@ def test_core_client_is_safe_under_concurrent_rpcs(extension):
     assert not errors, f"concurrent RPCs failed: {errors[:3]}"
     names = {row["name"] for row in extension.core.scheduled_queries()}
     assert "conc_a_9" in names and "conc_b_9" in names, "a concurrent push was lost"
+
+
+def test_registration_retries_past_a_stale_route(monkeypatch):
+    """A supervisor restart must not need a human: retry the duplicate."""
+    import osquery_opamp.extension as extension_module
+    from osquery_opamp.core import CoreError
+
+    attempts = {"n": 0}
+
+    class FakeCore:
+        def register(self, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise CoreError("registerExtension failed: Duplicate extension registered")
+            return 4242
+
+    ext = extension_module.OsqueryExtension("/tmp/does-not-matter")
+    ext.core = FakeCore()
+    monkeypatch.setattr(extension_module.time, "sleep", lambda _s: None)
+
+    assert ext._register(wait=0.0, duplicate_wait=5.0) == 4242
+    assert attempts["n"] == 3
+
+
+def test_registration_does_not_retry_a_real_error(monkeypatch):
+    """Only duplicates are transient; a bad socket must fail immediately."""
+    import osquery_opamp.extension as extension_module
+    from osquery_opamp.core import CoreError
+
+    attempts = {"n": 0}
+
+    class FakeCore:
+        def register(self, **kwargs):
+            attempts["n"] += 1
+            raise CoreError("registerExtension failed: socket is not writable")
+
+    ext = extension_module.OsqueryExtension("/tmp/does-not-matter")
+    ext.core = FakeCore()
+    monkeypatch.setattr(extension_module.time, "sleep", lambda _s: None)
+
+    try:
+        ext._register(wait=0.0, duplicate_wait=5.0)
+    except CoreError as exc:
+        assert "not writable" in str(exc)
+    else:
+        raise AssertionError("a non-duplicate error must not be retried")
+    assert attempts["n"] == 1

@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "websockets>=13"]
 
 [project.scripts]
 osquery-opamp = "osquery_opamp.__main__:main"

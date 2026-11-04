@@ -3,6 +3,15 @@
 What the server sees, and what it must not assume. Verified against osquery
 5.24.0 on macOS arm64 with the tests in `tests/`.
 
+## Version drift
+
+`osquery_info` and `osquery_schedule` are read with `select *` and projected to
+the columns OpAMP reports, so a daemon that drops or renames a column produces a
+missing attribute rather than a failed query. The SDK version reported at
+registration is the daemon's real version; when it cannot be read, the minimum
+the daemon accepts is reported and `osquery.sdk_version_source` is set to
+`unknown`, rather than inventing a plausible number.
+
 ## What `APPLIED` actually means
 
 `Config::update()` returns OK when the JSON **parses** and is merged. It does
@@ -40,7 +49,41 @@ filesystem config.
 On a daemon restart the pushed source is gone until the extension re-pushes it.
 There is a window at boot where the daemon runs on its own config only.
 
+## Pull mode requires `--extensions_require`
+
+`--config_plugin=opamp` is not a drop-in replacement for `--config_plugin=tls`.
+osquery resolves the active config plugin during `Initializer::init()`, *before*
+`Config::load()`, and the plugin has to exist in the registry at that moment.
+An extension can only register once the daemon's manager socket exists, so the
+daemon has to wait for it:
+
+```bash
+osqueryd --config_plugin=opamp --extensions_require=opamp --extensions_timeout=30
+```
+
+Measured on 5.24.0 without `--extensions_require`:
+
+```
+E shutdown.cpp:80] Cannot activate opamp config plugin: Unknown registry plugin: opamp
+```
+
+followed by `requestShutdown`. osqueryd exits during startup - it does not run
+with an empty config, and `--config_refresh` defaults to 0, so there is no
+retry. Treat the two flags as a unit.
+
+Once registered in time, the daemon calls `genConfig` once (no `source` key in
+the request; the extension answers from `--source`, default `opamp`) and caches
+the result. `--pull-wait` bounds how long that call may block waiting for the
+first OpAMP config. Returning `EXT_FAILED` there is honest but not fatal: the
+first `config/update` push repairs the daemon without a restart.
+
 ## Identity
+
+The transport differs by platform - a Unix domain socket on POSIX, a named pipe
+(`\\.\pipe\osquery.em.<uuid>`) on Windows - but the routing is identical:
+`getExtensionSocket()` is string concatenation on both, so the extension and the
+daemon agree on the path without any Windows-specific logic beyond the socket
+type itself.
 
 The daemon does not authenticate the extension beyond the socket's filesystem
 permissions, and the extension is registered under a name that must be unique per

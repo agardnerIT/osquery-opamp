@@ -40,12 +40,25 @@ def find_osqueryd() -> str:
 
 
 class Daemon:
-    def __init__(self, root: Path, extensions_interval: int = 1, watchdog: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        extensions_interval: int = 1,
+        watchdog: bool = False,
+        config_plugin: str = "filesystem",
+        extensions_require: str = "",
+        extensions_timeout: str = "3",
+    ) -> None:
         """Boot osqueryd.
 
         ``watchdog=False`` is the default because the watcher/worker pair takes
         ~5s to shut down and the extension-visible behaviour is identical. One
         test runs with the watchdog on, so that topology stays covered.
+
+        ``config_plugin="opamp"`` switches the daemon to pull mode. osquery
+        resolves the active config plugin *before* it loads configuration, so a
+        pulled config only works when the extension is registered by then -
+        ``extensions_require`` makes the daemon wait for it.
         """
         self.root = root
         self.socket = str(root / "osq.em")
@@ -65,8 +78,10 @@ class Daemon:
                 "--disable_database",
                 f"--extensions_socket={self.socket}",
                 f"--extensions_interval={extensions_interval}",
-                "--config_plugin=filesystem",
+                f"--config_plugin={config_plugin}",
                 f"--config_path={config_path}",
+                *([f"--extensions_require={extensions_require}"] if extensions_require else []),
+                f"--extensions_timeout={extensions_timeout}",
                 "--logger_plugin=filesystem",
                 f"--logger_path={self.log_dir}",
                 "--disable_events=true",

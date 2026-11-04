@@ -28,6 +28,15 @@ from .opamp.identity import IdentityStore, default_identity_path
 from .opamp.transport import WebSocketTransport
 from .osquery_thrift import default_manager_socket
 
+#: How long a cold ``--config_plugin=opamp`` request waits for the first config.
+#: It delays daemon startup, so it is bounded and documented rather than infinite.
+DEFAULT_PULL_WAIT_SECONDS = 10.0
+
+#: Registration retry budget. Covers systemd starting both units at once and
+#: osqueryd's own ``--extensions_require`` wait, without making a mistyped
+#: ``--extensions-socket`` take 30s to report.
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 10.0
+
 log = logging.getLogger("osquery_opamp")
 
 
@@ -72,6 +81,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="extra HTTP header for the WebSocket handshake (repeatable)",
     )
     parser.add_argument(
+        "--pull-wait",
+        type=float,
+        default=DEFAULT_PULL_WAIT_SECONDS,
+        help=(
+            "seconds a --config_plugin=opamp config request may wait for the first"
+            " OpAMP config (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        help=(
+            "seconds to retry registering with osqueryd before giving up; raise it"
+            " when osqueryd uses --extensions_require (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--enable-commands",
         action="store_true",
         help="advertise com.osquery.query and run ad-hoc SQL from the server",
@@ -97,9 +124,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     identity = IdentityStore(args.identity)
     uid = identity.load_or_create()
 
-    extension = OsqueryExtension(args.extensions_socket, version=_version())
+    extension = OsqueryExtension(
+        args.extensions_socket,
+        version=_version(),
+        source=args.source,
+        pull_wait=args.pull_wait,
+    )
     try:
-        extension.start()
+        extension.start(wait=args.startup_timeout)
     except Exception as exc:  # noqa: BLE001 - a clear message beats a traceback
         log.error("could not register with osqueryd at %s: %s", args.extensions_socket, exc)
         log.error(
@@ -117,6 +149,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         commands_enabled=args.enable_commands,
         query_runner=(lambda sql: (extension.core.query(sql), None)) if args.enable_commands else None,
         identity_store=identity,
+        sdk_version_source=extension.sdk_version_source,
     )
     client = OpampClient(
         agent,

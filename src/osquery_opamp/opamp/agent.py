@@ -63,6 +63,7 @@ class OpampAgent:
         commands_enabled: bool = False,
         query_runner: Optional[QueryRunner] = None,
         identity_store: Any = None,
+        sdk_version_source: str = "",
         clock: Callable[[], float] = time.time,
     ) -> None:
         constants.capabilities_sanity_check()
@@ -75,6 +76,7 @@ class OpampAgent:
         self.commands_enabled = commands_enabled
         self.query_runner = query_runner
         self.identity_store = identity_store
+        self.sdk_version_source = sdk_version_source
         self._clock = clock
 
         self.sequence_num = 0
@@ -232,15 +234,23 @@ class OpampAgent:
 
         body = bytes(obj.body)
         computed = hashlib.sha256(body).digest()
-        if remote_config.config_hash:
-            if remote_config.config_hash != computed:
-                log.warning(
-                    "server config_hash does not match the body; reporting the server's"
-                    " value so it can correlate"
-                )
-            report_hash = bytes(remote_config.config_hash)
-        else:
-            report_hash = computed
+        # config_hash is server-defined: the reference server hashes a canonical
+        # encoding of the whole config map, not the body, so a body hash will not
+        # match and comparing them proves nothing. Use the server's value verbatim
+        # (that is what it correlates on) and only compute our own when absent.
+        report_hash = bytes(remote_config.config_hash) if remote_config.config_hash else computed
+
+        if (
+            report_hash
+            and report_hash == self.last_remote_config_hash
+            and self.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
+        ):
+            # Desired-state servers re-offer the active config on every reply.
+            # Re-applying it churns the daemon's config hash and status logs for
+            # no reason; the spec gives us the hash precisely to detect this.
+            log.debug("remote config unchanged (hash=%s); not re-applying", report_hash.hex()[:16])
+            self._effective_config_dirty = True
+            return
 
         # Validate JSON before claiming anything applied: osquery itself only
         # rejects unparseable JSON, and we want the failure attributed correctly.
@@ -313,6 +323,7 @@ class OpampAgent:
         if expire_at and self._clock() > float(expire_at):
             return [self._query_response(custom_message.data, error="expired")]
 
+        log.info("running remote query id=%r", request_id)
         started = self._clock()
         try:
             rows, error = self.query_runner(sql)
@@ -321,12 +332,16 @@ class OpampAgent:
         duration_ms = int((self._clock() - started) * 1000)
 
         if error is not None:
+            log.warning("remote query id=%r failed: %s", request_id, error)
             return [
                 self._query_response(
                     custom_message.data, error=error, duration_ms=duration_ms
                 )
             ]
 
+        log.info(
+            "remote query id=%r returned %d row(s) in %dms", request_id, len(rows), duration_ms
+        )
         columns = list(rows[0].keys()) if rows else []
         body = {
             "id": request_id,
@@ -400,6 +415,11 @@ class OpampAgent:
             extra_non_identifying={
                 "osquery.opamp_sequence_num": self.sequence_num,
                 "osquery.opamp_ignored_uid_messages": self._ignored_uid_messages,
+                **(
+                    {"osquery.sdk_version_source": self.sdk_version_source}
+                    if self.sdk_version_source
+                    else {}
+                ),
             },
         )
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 
-import pytest
 
 from osquery_opamp.opamp import constants
 from osquery_opamp.opamp.agent import OpampAgent
@@ -258,3 +257,59 @@ def test_sequence_numbers_never_repeat():
     seen += [reply.sequence_num for reply in agent.handle(opamp.ServerToAgent(custom_message=request))]
     seen.append(agent.disconnect_message().sequence_num)
     assert seen == sorted(set(seen)), f"sequence numbers must strictly increase: {seen}"
+
+
+def test_websocket_framing_header():
+    """Spec: each WS frame is a varint header (0) then the protobuf."""
+    from osquery_opamp.opamp.transport import TransportError, decode_header, encode_header
+
+    assert encode_header(0) == b"\x00"
+    assert encode_header(0x7F) == b"\x7f"
+    assert encode_header(0x80) == b"\x80\x01"
+
+    assert decode_header(b"\x00rest") == 1
+    # A non-zero header is reserved for future use and must be rejected.
+    try:
+        decode_header(b"\x01rest")
+    except TransportError as exc:
+        assert "unsupported" in str(exc)
+    else:
+        raise AssertionError("non-zero header should be rejected")
+    # Truncated varint (all continuation bits set).
+    try:
+        decode_header(b"\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80")
+    except TransportError as exc:
+        assert "truncated" in str(exc)
+    else:
+        raise AssertionError("truncated header should be rejected")
+
+
+def test_reoffered_config_is_not_reapplied():
+    """Desired-state servers re-offer the active config on every reply."""
+    core = FakeCore()
+    agent = make_agent(core)
+    body = b'{"schedule": {}}'
+    message = remote_config(body, config_hash=b"\x07" * 32)
+
+    agent.handle(message)
+    assert len(core.pushes) == 1
+    assert agent.next_message().remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED
+
+    # Same hash offered again: no second push, status stays APPLIED.
+    agent.handle(message)
+    assert len(core.pushes) == 1, "an unchanged config must not be re-applied"
+    assert agent.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
+
+    # A different hash is a real change and must be applied.
+    agent.handle(remote_config(body, config_hash=b"\x08" * 32))
+    assert len(core.pushes) == 2
+
+
+def test_server_config_hash_is_not_compared_to_a_body_hash():
+    """config_hash is server-defined; a body hash mismatch is not an error."""
+    core = FakeCore()
+    agent = make_agent(core)
+    body = b'{"schedule": {}}'
+    agent.handle(remote_config(body, config_hash=b"\x09" * 32))
+    assert agent.next_message().remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED
+    assert agent.last_remote_config_hash == b"\x09" * 32

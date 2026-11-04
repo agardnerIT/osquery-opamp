@@ -9,6 +9,7 @@ synchronous code.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -17,6 +18,9 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import serve
 
 from osquery_opamp.opamp.pb import opamp
+from osquery_opamp.opamp.transport import decode_header, encode_header
+
+log = logging.getLogger(__name__)
 
 Predicate = Callable[[Any], bool]
 
@@ -58,8 +62,8 @@ class FakeOpampServer:
         try:
             if self._connection is not None:
                 self._connection.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 - shutdown is best effort
+            log.debug("closing the agent connection failed: %s", exc)
         if self._server is not None:
             self._server.shutdown()
         if self._thread is not None:
@@ -79,11 +83,13 @@ class FakeOpampServer:
         self.connection_count += 1
         self._connected.set()
         if self.send_initial_state:
-            ws.send(self.server_state().SerializeToString())
+            self._send_framed(ws, self.server_state())
         try:
             for raw in ws:
+                # Enforce the spec's framing: a varint header (0) then protobuf.
+                header_len = decode_header(raw)
                 message = opamp.AgentToServer()
-                message.ParseFromString(raw)
+                message.ParseFromString(raw[header_len:])
                 with self._lock:
                     self._messages.append(message)
         except ConnectionClosed:
@@ -125,7 +131,11 @@ class FakeOpampServer:
         connection = self._connection
         if connection is None:
             raise RuntimeError("no agent connected")
-        connection.send(message.SerializeToString())
+        self._send_framed(connection, message)
+
+    @staticmethod
+    def _send_framed(connection: Any, message: Any) -> None:
+        connection.send(encode_header(0) + message.SerializeToString())
 
     def drop_connection(self) -> None:
         connection = self._connection

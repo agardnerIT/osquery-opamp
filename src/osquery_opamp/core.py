@@ -38,6 +38,25 @@ from .osquery_thrift import (
 
 log = logging.getLogger(__name__)
 
+#: ``osquery_info`` columns this package reports. Kept as a projection over
+#: ``select *`` rather than a SELECT list, so a daemon that drops or renames a
+#: column degrades to a missing attribute instead of a failing query.
+INFO_COLUMNS = (
+    "version",
+    "config_hash",
+    "config_valid",
+    "pid",
+    "uuid",
+    "instance_id",
+    "start_time",
+    "watcher",
+    "build_platform",
+    "build_distro",
+)
+
+#: ``osquery_schedule`` columns this package reports.
+SCHEDULE_COLUMNS = ("name", "query", "interval")
+
 
 class CoreError(RuntimeError):
     """A call reached the daemon and failed."""
@@ -56,19 +75,53 @@ class ConfigPushResult:
 class CoreClient:
     """Thin, typed wrapper over the daemon's ``ExtensionManager``.
 
-    One instance per connection. The underlying Thrift client is not thread
-    safe; the extension serialises access with a lock (see ``Extension``).
+    The underlying Thrift client is not thread safe; every call is serialised
+    with a lock (see ``Extension``). The connection is opened lazily and dropped
+    on transport failure, so constructing a ``CoreClient`` never requires the
+    daemon to be up - which is what lets an extension wait for a daemon that is
+    still starting, and reconnect to one that restarted underneath it.
     """
 
     def __init__(self, manager_socket: str, timeout_ms: int = 5000) -> None:
         self.manager_socket = manager_socket
-        self._client = make_manager_client(manager_socket, timeout_ms=timeout_ms)
+        self.timeout_ms = timeout_ms
+        self._client: Any = None
         # One Thrift client owns one socket. The extension pings the daemon from
         # its liveness thread while the OpAMP thread pushes config, so every RPC
         # must be serialised or the two interleave on the wire and responses get
         # mismatched with requests. This is not theoretical: it produced a
         # silent "config never applied" before the lock existed.
         self._lock = threading.RLock()
+
+    # -- connection --------------------------------------------------------
+
+    def _connection(self) -> Any:
+        if self._client is None:
+            self._client = make_manager_client(self.manager_socket, timeout_ms=self.timeout_ms)
+        return self._client
+
+    def _drop(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                client._oprot.trans.close()
+            except Exception as exc:  # noqa: BLE001 - already failing
+                log.debug("closing the daemon connection failed: %s", exc)
+
+    def close(self) -> None:
+        """Drop the connection, if any. Safe to call more than once."""
+        with self._lock:
+            self._drop()
+
+    def _rpc(self, call: Any) -> Any:
+        """Run one RPC, reconnecting on the next call if the transport failed."""
+        with self._lock:
+            client = self._connection()
+            try:
+                return call(client)
+            except Exception:
+                self._drop()
+                raise
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -82,8 +135,7 @@ class CoreClient:
     ) -> int:
         """Register this extension and return its route UUID."""
         info = self._info(name, version, sdk_version, min_sdk_version)
-        with self._lock:
-            status: ExtensionStatus = self._client.registerExtension(info, registry)
+        status: ExtensionStatus = self._rpc(lambda c: c.registerExtension(info, registry))
         if status.code != EXT_SUCCESS:
             raise CoreError(f"registerExtension failed: {status.message}")
         if not status.uuid:
@@ -92,16 +144,14 @@ class CoreClient:
 
     def deregister(self, uuid: int) -> None:
         try:
-            with self._lock:
-                self._client.deregisterExtension(uuid)
+            self._rpc(lambda c: c.deregisterExtension(uuid))
         except Exception as exc:  # noqa: BLE001 - best effort on shutdown
             log.debug("deregisterExtension(%s) failed: %s", uuid, exc)
 
     def ping(self) -> bool:
         """Ping the daemon. False means the daemon is gone."""
         try:
-            with self._lock:
-                status: ExtensionStatus = self._client.ping()
+            status: ExtensionStatus = self._rpc(lambda c: c.ping())
         except Exception as exc:  # noqa: BLE001 - transport failures are expected
             log.debug("ping failed: %s", exc)
             return False
@@ -109,16 +159,14 @@ class CoreClient:
 
     def extensions(self) -> Dict[int, Any]:
         try:
-            with self._lock:
-                return dict(self._client.extensions())
+            return dict(self._rpc(lambda c: c.extensions()))
         except Exception as exc:  # noqa: BLE001
             log.debug("extensions() failed: %s", exc)
             return {}
 
     def options(self) -> Dict[str, Any]:
         try:
-            with self._lock:
-                return dict(self._client.options())
+            return dict(self._rpc(lambda c: c.options()))
         except Exception as exc:  # noqa: BLE001
             log.debug("options() failed: %s", exc)
             return {}
@@ -147,8 +195,7 @@ class CoreClient:
         """
         request = {"action": "update", "source": source, "data": payload}
         try:
-            with self._lock:
-                response = self._client.call("config", "update", request)
+            response = self._rpc(lambda c: c.call("config", "update", request))
         except Exception as exc:  # noqa: BLE001
             return ConfigPushResult(False, f"transport error: {exc}")
 
@@ -161,8 +208,7 @@ class CoreClient:
     def query(self, sql: str) -> List[Dict[str, str]]:
         """Run ``sql`` in the daemon and return rows as dicts of strings."""
         try:
-            with self._lock:
-                response = self._client.query(sql)
+            response = self._rpc(lambda c: c.query(sql))
         except Exception as exc:  # noqa: BLE001
             raise CoreError(f"query failed: {exc}") from exc
         if response.status.code != EXT_SUCCESS:
@@ -170,14 +216,26 @@ class CoreClient:
         return rows_to_dicts(response)
 
     def osquery_info(self) -> Dict[str, str]:
-        rows = self.query(
-            "select version, config_hash, config_valid, pid, uuid, instance_id,"
-            " start_time, watcher, build_platform, build_distro from osquery_info"
-        )
-        return rows[0] if rows else {}
+        """One row of ``osquery_info``, restricted to the columns we report.
+
+        Selected with ``*`` on purpose. The column set changes between osquery
+        releases (``instance_id`` is newer than the rest, and ``build_platform``
+        is not present on every build), and naming columns explicitly turns a
+        schema change into a hard ``query rejected`` failure. Reading ``*`` and
+        projecting here degrades instead: a missing column is simply absent.
+        """
+        rows = self.query("select * from osquery_info")
+        row = rows[0] if rows else {}
+        return {name: row.get(name, "") for name in INFO_COLUMNS}
 
     def scheduled_queries(self) -> List[Dict[str, str]]:
-        return self.query("select name, query, interval from osquery_schedule")
+        """The live schedule, projected to the columns OpAMP reports.
+
+        Same reasoning as ``osquery_info``: ``osquery_schedule`` carries a dozen
+        version-dependent performance columns, and we need three of them.
+        """
+        rows = self.query("select * from osquery_schedule")
+        return [{name: row.get(name, "") for name in SCHEDULE_COLUMNS} for row in rows]
 
     # -- helpers -----------------------------------------------------------
 

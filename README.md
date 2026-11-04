@@ -14,14 +14,16 @@ registry calls that already exist:
 
 ## Status
 
-Working and tested against a real `osqueryd` 5.24.0 (39 tests, ~41s):
+Working and tested against a real `osqueryd` 5.24.0 (65 tests, ~58s):
 
 osquery side
 - extension registration and liveness (the daemon pings us and drops us after two
   misses, so the extension serves its own Thrift socket)
 - config push into the live schedule, per-source replacement semantics
 - config hash / validity read-back, scheduled-query read-back
-- pull mode (`genConfig` served from the last pushed config)
+- pull mode (`--config_plugin=opamp`), including a real daemon booting on a
+  config served by `genConfig` - see "Pull mode" below
+- the same code path on Windows, where the extension API is a named pipe
 - concurrent RPC safety (one Thrift client, serialised - see below)
 
 OpAMP side (spec v0.20.0)
@@ -52,13 +54,46 @@ Not implemented, and not advertised in the capability bitmask
 ```
 
 Add `--enable-commands` to allow ad-hoc SQL, `--source` to change the osquery
-config source name, `--heartbeat`/`--retry` to tune timing. `--help` lists all of
-them.
+config source name, `--heartbeat`/`--retry` to tune timing, `--startup-timeout`
+to wait longer for a daemon that is still starting, and `--pull-wait` to bound
+how long a pull-mode config request may block. `--help` lists all of them.
+
+### Pull mode
+
+`--config_plugin=opamp` needs **two** flags on the daemon, not one:
+
+```bash
+osqueryd --config_plugin=opamp --extensions_require=opamp --extensions_timeout=30
+```
+
+`--extensions_require` makes osquery wait for the extension inside
+`startExtensionManager()`, which runs before `initActivePlugin("config", ...)`
+and before config is loaded. Without it, osqueryd does not degrade gracefully -
+it exits during startup:
+
+```
+E shutdown.cpp:80] Cannot activate opamp config plugin: Unknown registry plugin: opamp
+```
+
+(`--config_refresh` defaults to 0, so even a daemon that survived would never
+retry.) The extension retries registration for `--startup-timeout` seconds for
+the same reason: the daemon holds the manager socket open while it waits for us.
+
+With that in place the daemon asks for config once. `genConfig` answers from the
+configuration the OpAMP server most recently pushed, waiting up to `--pull-wait`
+seconds (default 10) for the first one to arrive. If none arrives, the extension
+returns a failure rather than an empty config, and the first push repairs the
+daemon without a restart.
 
 ## Requirements
 
 - osqueryd (tested with 5.24.0; the macOS `.pkg` only symlinks `osqueryi` and
   `osqueryctl` into `/usr/local/bin`, so point `OSQUERYD` at the bundle path)
+- Windows: supported via named pipes (`src/osquery_opamp/winpipe.py`). No
+  extra dependency - the kernel32 bindings are ctypes. The transport is covered
+  by `tests/test_winpipe.py` on every platform and by
+  `tests/test_windows_daemon.py` against a real `osqueryd.exe`, which only runs
+  on Windows
 - Python 3.10+ with `thriftpy2`, `protobuf>=7.34.1,<8`, `websocket-client`
 
 ## Development
@@ -77,6 +112,7 @@ temporary paths, so they need no root and leave no state behind. Set
 
 ```
 src/osquery_opamp/osquery_thrift.py   vendored IDL loader, socket paths, client/server factories
+src/osquery_opamp/winpipe.py          Windows named-pipe transport (client and server)
 src/osquery_opamp/core.py             typed wrapper over the daemon's registry calls
 src/osquery_opamp/extension.py        registration, liveness, Thrift Extension service
 vendor/osquery.thrift                 copied from osquery (Apache-2.0)

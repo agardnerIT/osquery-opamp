@@ -22,6 +22,39 @@ class TransportError(RuntimeError):
     pass
 
 
+def encode_header(value: int = 0) -> bytes:
+    """Encode the WebSocket message header (spec: varint, currently always 0)."""
+    if value < 0:
+        raise ValueError("header must be unsigned")
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def decode_header(data: bytes) -> int:
+    """Decode the leading varint header, raising on a malformed one.
+
+    Per the spec a compliant decoder SHOULD verify the header is 0 and treat
+    anything else as a malformed message, which is what this does.
+    """
+    value = 0
+    shift = 0
+    for index, byte in enumerate(data[:10]):
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            if value != 0:
+                raise TransportError(f"unsupported OpAMP websocket header {value}")
+            return index + 1
+        shift += 7
+    raise TransportError("truncated OpAMP websocket header")
+
+
 class Transport(Protocol):
     def connect(self) -> None: ...
     def send(self, payload: bytes) -> None: ...
@@ -97,7 +130,8 @@ class WebSocketTransport:
         import websocket
 
         try:
-            self._ws.send_binary(payload)
+            # Every frame is a varint header (0) followed by the protobuf.
+            self._ws.send_binary(encode_header(0) + payload)
         except websocket.WebSocketTimeoutException as exc:
             raise TransportError(f"send timed out: {exc}") from exc
         except Exception as exc:  # noqa: BLE001
@@ -123,7 +157,10 @@ class WebSocketTransport:
             return None
         if isinstance(data, str):
             data = data.encode("utf-8")
-        return data
+        if not data:
+            return None
+        header_len = decode_header(data)
+        return data[header_len:]
 
     def close(self) -> None:
         if self._ws is None:
