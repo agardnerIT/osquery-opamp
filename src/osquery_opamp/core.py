@@ -1,6 +1,6 @@
 """The operations this extension performs against a running osquery daemon.
 
-Three of them matter, and each maps onto a documented registry item:
+Each one maps onto a documented registry item or RPC:
 
 ``push_config``
     ``Registry::call("config", "update", ...)`` -> ``ConfigPlugin::call`` ->
@@ -8,6 +8,18 @@ Three of them matter, and each maps onto a documented registry item:
     exactly as if a config plugin had produced it. This is the mechanism
     ``plugins/config/update.cpp`` exists for: an extension changing core config
     asynchronously.
+
+``config_sources``
+    ``Registry::call("config", <plugin>, {"action": "genConfig"})`` returns the
+    raw JSON each source currently contributes. This is how the agent can report
+    a config it did not push itself - but only for plugins whose ``genConfig``
+    is a pure read. ``tls`` is not one: it performs an HTTP fetch and answers
+    "config unchanged" with no body when the etag matches.
+
+``query_columns``
+    ``ExtensionManager.getQueryColumns(sql)`` prepares a statement without
+    running it. Used to reject a pushed config whose scheduled queries cannot
+    compile, which ``Config::update()`` itself accepts happily.
 
 ``query``
     ``ExtensionManager.query(sql)`` runs against the daemon's SQLite, including
@@ -27,7 +39,7 @@ import json
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .osquery_thrift import (
     EXT_SUCCESS,
@@ -56,6 +68,18 @@ INFO_COLUMNS = (
 
 #: ``osquery_schedule`` columns this package reports.
 SCHEDULE_COLUMNS = ("name", "query", "interval")
+
+#: ``osquery_schedule`` columns used for the state snapshot. ``executions`` and
+#: ``denylisted`` distinguish "pushed and running" from "pushed and failing".
+STATE_SCHEDULE_COLUMNS = ("name", "query", "interval", "executions", "denylisted")
+
+#: ``osquery_packs`` columns used for the state snapshot.
+STATE_PACK_COLUMNS = ("name", "active")
+
+#: Config plugins whose ``genConfig`` can be called purely for reading. Anything
+#: else may have side effects (``tls`` fetches over the network, ``opamp`` would
+#: block on the OpAMP server, ...), so it is not read back.
+SIDE_EFFECT_FREE_CONFIG_PLUGINS = frozenset({"filesystem"})
 
 
 class CoreError(RuntimeError):
@@ -171,6 +195,14 @@ class CoreClient:
             log.debug("options() failed: %s", exc)
             return {}
 
+    def flags(self) -> Dict[str, str]:
+        """The daemon's flags as plain strings (``options()`` returns structs)."""
+        return {name: str(getattr(info, "value", "")) for name, info in self.options().items()}
+
+    def active_config_plugin(self) -> str:
+        """The config plugin the daemon is actually running, or ``""`` if unknown."""
+        return self.flags().get("config_plugin", "")
+
     # -- config ------------------------------------------------------------
 
     def push_config(self, source: str, config: Dict[str, Any]) -> ConfigPushResult:
@@ -205,6 +237,60 @@ class CoreClient:
 
     # -- read-back ---------------------------------------------------------
 
+    def config_sources(self, plugin: Optional[str] = None) -> Dict[str, str]:
+        """Read the config sources the daemon is running, keyed by source name.
+
+        Only side-effect-free plugins are read (see
+        ``SIDE_EFFECT_FREE_CONFIG_PLUGINS``); for anything else this returns an
+        empty mapping and logs why, rather than reaching into a plugin whose
+        ``genConfig`` would fetch from the network or block on a server.
+
+        What comes back is the *sources*, not the merge: osquery's merge of them
+        is deterministic, but the merged document is not exposed by any RPC.
+        """
+        plugin = plugin if plugin is not None else self.active_config_plugin()
+        if plugin not in SIDE_EFFECT_FREE_CONFIG_PLUGINS:
+            log.debug(
+                "not reading config sources back: active plugin %r is not known to be "
+                "side-effect free",
+                plugin or "unknown",
+            )
+            return {}
+
+        try:
+            response = self._rpc(
+                lambda c: c.call("config", plugin, {"action": "genConfig"})
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must survive this
+            log.debug("reading config sources from %s failed: %s", plugin, exc)
+            return {}
+
+        if response.status.code != EXT_SUCCESS:
+            log.debug(
+                "reading config sources from %s failed: %s", plugin, response.status.message
+            )
+            return {}
+
+        sources: Dict[str, str] = {}
+        for entry in response.response or []:
+            for source, body in dict(entry).items():
+                sources[str(source)] = str(body)
+        return sources
+
+    def query_columns(self, sql: str) -> List[Dict[str, str]]:
+        """Prepare ``sql`` (without running it) and return its columns.
+
+        Raises ``CoreError`` with osquery's own message when the statement does
+        not compile - ``"no such table: batteries"``, ``"incomplete input"`` -
+        which is exactly the text an operator needs to see in a config error.
+        """
+        try:
+            response = self._rpc(lambda c: c.getQueryColumns(sql))
+        except Exception as exc:  # noqa: BLE001
+            raise CoreError(f"getQueryColumns failed: {exc}") from exc
+        if response.status.code != EXT_SUCCESS:
+            raise CoreError(response.status.message or "query did not compile")
+        return rows_to_dicts(response)
     def query(self, sql: str) -> List[Dict[str, str]]:
         """Run ``sql`` in the daemon and return rows as dicts of strings."""
         try:
@@ -237,6 +323,18 @@ class CoreClient:
         rows = self.query("select * from osquery_schedule")
         return [{name: row.get(name, "") for name in SCHEDULE_COLUMNS} for row in rows]
 
+    def schedule_state(self) -> List[Dict[str, str]]:
+        """The live schedule with execution counters, for the state snapshot."""
+        rows = self.query("select * from osquery_schedule")
+        return [
+            {name: row.get(name, "") for name in STATE_SCHEDULE_COLUMNS} for row in rows
+        ]
+
+    def packs_state(self) -> List[Dict[str, str]]:
+        """The loaded packs, for the state snapshot."""
+        rows = self.query("select * from osquery_packs")
+        return [{name: row.get(name, "") for name in STATE_PACK_COLUMNS} for row in rows]
+
     # -- helpers -----------------------------------------------------------
 
     @staticmethod
@@ -251,4 +349,9 @@ class CoreClient:
         )
 
 
-__all__ = ["CoreClient", "CoreError", "ConfigPushResult"]
+__all__ = [
+    "CoreClient",
+    "CoreError",
+    "ConfigPushResult",
+    "SIDE_EFFECT_FREE_CONFIG_PLUGINS",
+]

@@ -43,6 +43,14 @@ def _os_type() -> str:
     return {"darwin": "darwin", "linux": "linux", "windows": "windows"}.get(system, system)
 
 
+def kv(key: str, value: Any) -> Any:
+    """Build a ``KeyValue`` with the AnyValue variant that fits ``value``.
+
+    Public because health attributes are built outside this module.
+    """
+    return _kv(key, value)
+
+
 def build_description(
     instance_uid: bytes,
     info: Dict[str, str],
@@ -50,6 +58,7 @@ def build_description(
     service_name: str = SERVICE_DAEMON,
     hostname: Optional[str] = None,
     extension_version: Optional[str] = None,
+    config_plugin: str = "opamp",
     extra_identifying: Optional[Dict[str, Any]] = None,
     extra_non_identifying: Optional[Dict[str, Any]] = None,
 ) -> Any:
@@ -67,7 +76,11 @@ def build_description(
         ("os.type", _os_type()),
         ("os.description", info.get("build_distro") or platform.platform()),
         ("host.arch", info.get("build_platform") or platform.machine()),
-        ("osquery.config_plugin", "opamp"),
+        # The daemon's active config plugin, not ours: an extension can push into
+        # a daemon that is configured by the filesystem or tls plugin, and
+        # claiming "opamp" there would hide exactly the conflict an operator
+        # needs to see.
+        ("osquery.config_plugin", config_plugin),
     ]
     if extension_version:
         identifying.append(("osquery.opamp_extension_version", extension_version))
@@ -108,4 +121,10 @@ def description_to_dict(description: Any) -> Dict[str, Any]:
     return out
 
 
-__all__ = ["build_description", "description_to_dict", "SERVICE_DAEMON", "SERVICE_SHELL"]
+__all__ = [
+    "build_description",
+    "description_to_dict",
+    "kv",
+    "SERVICE_DAEMON",
+    "SERVICE_SHELL",
+]

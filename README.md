@@ -30,7 +30,15 @@ OpAMP side (spec v0.20.0)
 - WebSocket transport, `wss://` with CA verification
 - `AgentDescription` from `osquery_info`, honest capability bitmask
 - remote config → `config/update`, with `APPLYING`/`APPLIED`/`FAILED` status
-- effective config (when the server advertises `AcceptsEffectiveConfig`)
+- pushed configs are **pre-compiled** before they are applied, so a schedule
+  naming a table that does not exist is refused with osquery's own error instead
+  of being reported as applied (`--no-validate-queries` opts out)
+- effective config (when the server advertises `AcceptsEffectiveConfig`),
+  including the config sources the daemon runs besides ours (filesystem plugin
+  only, read back over `config/genConfig`)
+- the daemon's live schedule, packs and config plugin in `ComponentHealth`
+  attributes, refreshed every `--state-interval`
+- duplicate query names across config sources reported as `config_conflict`
 - `ComponentHealth`, heartbeats, `ReportFullState`, server-assigned `instance_uid`
 - `com.osquery.query` custom capability (opt-in via `--enable-commands`)
 - reconnect with exponential backoff, jitter and the spec's 30s floor
@@ -38,9 +46,12 @@ OpAMP side (spec v0.20.0)
 
 Not implemented, and not advertised in the capability bitmask
 - `RESTART`: an extension has no RPC that restarts the daemon. A restart command
-  is refused and surfaced in `ComponentHealth.last_error`.
+  is refused and surfaced in `ComponentHealth.last_error`. Config changes do not
+  need one: the scheduler re-reads the merged schedule every tick, so an interval
+  change takes effect on the next tick without restarting anything.
 - packages, `own_metrics`/`own_traces`/`own_logs`
 - connection settings (`ConnectionSettingsOffers`), plain-HTTP transport
+- the *merged* config: no RPC exposes it, so sources are reported instead
 
 ## Run it
 
@@ -55,8 +66,10 @@ Not implemented, and not advertised in the capability bitmask
 
 Add `--enable-commands` to allow ad-hoc SQL, `--source` to change the osquery
 config source name, `--heartbeat`/`--retry` to tune timing, `--startup-timeout`
-to wait longer for a daemon that is still starting, and `--pull-wait` to bound
-how long a pull-mode config request may block. `--help` lists all of them.
+to wait longer for a daemon that is still starting, `--pull-wait` to bound how
+long a pull-mode config request may block, `--state-interval` to change how often
+the daemon's live schedule is read, and `--no-validate-queries` to push configs
+without pre-compiling their SQL. `--help` lists all of them.
 
 ### Pull mode
 
@@ -130,6 +143,12 @@ config structure eagerly and validates SQL at execution time.
 So an OpAMP `APPLIED` status means "accepted and merged", **not** "the queries
 work". Per-query failures show up in `osquery_schedule` and the status logs. See
 `docs/opamp-contract.md`.
+
+Except: the agent compiles every scheduled query before pushing, so a config
+that would fail at execution time is refused with osquery's own error text
+(`scheduled query 'battery' does not compile: no such table: batteries`) and the
+previous config keeps running. `--no-validate-queries` restores the old
+push-and-hope behaviour.
 
 ## Two bugs the tests found, for the record
 

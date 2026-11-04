@@ -12,6 +12,13 @@ Responsibilities:
   sub-messages; we report on change, on heartbeat, or when asked with
   ``ReportFullState``)
 * apply remote config and produce an honest ``RemoteConfigStatus``
+* reject a config whose scheduled queries cannot compile, because osquery
+  itself will not (``Config::update()`` accepts them and fails later, at
+  execution time)
+* report an effective config that includes the config sources the daemon is
+  running besides our own, when the active plugin can be read safely
+* notice when the daemon ends up with two queries of the same name, which is
+  what happens when a pushed source and a local file both define one
 * answer ``com.osquery.query`` custom messages
 
 Deliberate omissions, all advertised honestly via the capability bitmask:
@@ -33,12 +40,27 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import constants
-from .description import build_description
+from .configview import PRIMARY_OBJECT_NAME, source_documents
+from .description import build_description, kv
 from .pb import opamp
 
 log = logging.getLogger(__name__)
 
 QueryRunner = Callable[[str], Tuple[List[Dict[str, str]], Optional[str]]]
+
+#: How many scheduled queries one push will pre-compile. Each one is an RPC, and
+#: the whole check runs on the OpAMP thread, so a pathological config must not be
+#: able to stall heartbeats. Above this the config is pushed unchecked and the
+#: gap is logged.
+MAX_QUERIES_VALIDATED = 200
+
+#: How often the schedule/pack snapshot is refreshed, in seconds. The snapshot
+#: rides along with health, so this is the staleness bound on "what is actually
+#: running" as seen by the server.
+DEFAULT_STATE_INTERVAL = 60.0
+
+#: Sentinel meaning "the read failed", as opposed to "the answer was empty".
+_FAILED = object()
 
 
 @dataclass
@@ -64,6 +86,8 @@ class OpampAgent:
         query_runner: Optional[QueryRunner] = None,
         identity_store: Any = None,
         sdk_version_source: str = "",
+        validate_queries: bool = True,
+        state_interval: float = DEFAULT_STATE_INTERVAL,
         clock: Callable[[], float] = time.time,
     ) -> None:
         constants.capabilities_sanity_check()
@@ -77,6 +101,8 @@ class OpampAgent:
         self.query_runner = query_runner
         self.identity_store = identity_store
         self.sdk_version_source = sdk_version_source
+        self.validate_queries = validate_queries
+        self.state_interval = state_interval
         self._clock = clock
 
         self.sequence_num = 0
@@ -92,6 +118,15 @@ class OpampAgent:
 
         self.health = Health()
         self.start_time_unix_nano = int(clock() * 1_000_000_000)
+
+        # The daemon's own state, refreshed on an interval and reported with
+        # health. Empty until the first successful read.
+        self.config_plugin: str = ""
+        self.schedule_state: List[Dict[str, str]] = []
+        self.packs_state: List[Dict[str, str]] = []
+        self.config_sources: Dict[str, str] = {}
+        self.duplicate_queries: List[str] = []
+        self._state_deadline: float = 0.0
 
         # What needs to go out in the next message
         self._full_state_needed = True
@@ -116,6 +151,7 @@ class OpampAgent:
 
     def next_message(self) -> Any:
         """Build the next ``AgentToServer``, consuming the dirty flags."""
+        self.refresh_state()
         self.sequence_num += 1
         message = opamp.AgentToServer(
             instance_uid=self.instance_uid,
@@ -264,6 +300,15 @@ class OpampAgent:
             self._fail("config body must be a JSON object", report_hash)
             return
 
+        # Reject a config the daemon would accept and then fail on at execution
+        # time. ``Config::update()`` validates structure only, so this is the
+        # only place a broken scheduled query can be caught *before* the server
+        # is told the config is fine.
+        invalid = self.validate_config(parsed)
+        if invalid:
+            self._fail(invalid, report_hash)
+            return
+
         self.last_remote_config_hash = report_hash
         self.remote_config_status = opamp.RemoteConfigStatuses_APPLYING
         self.remote_config_error = ""
@@ -280,10 +325,156 @@ class OpampAgent:
         self.remote_config_error = ""
         self._status_dirty = True
         self._effective_config_dirty = True
-        self._set_health(True, "ok", "")
+        # Refresh immediately: the server asked for this config, so the next
+        # message should tell it what the daemon now has, not what it had up to
+        # ``state_interval`` ago.
+        self.refresh_state(force=True)
+        if self.duplicate_queries:
+            self._set_health(
+                True,
+                "config_conflict",
+                "the same query name is scheduled more than once: "
+                + ", ".join(self.duplicate_queries)
+                + " (a pushed source and a local config source both define it)",
+            )
+        else:
+            self._set_health(True, "ok", "")
         log.info(
             "applied remote config (%d bytes, hash=%s)", len(body), report_hash.hex()[:16]
         )
+
+    # -- config validation -------------------------------------------------
+
+    def validate_config(self, config: Dict[str, Any]) -> str:
+        """Return ``""`` if the config's queries compile, else osquery's error.
+
+        Only statements are checked, and only in the two places a config puts
+        them: ``schedule`` and inline packs. A pack that names a file path
+        rather than an object is left to osquery, and so is everything else -
+        this is a compile check, not a schema validator.
+
+        Degrades to "no opinion" when the daemon cannot answer (old osquery, a
+        transport error): reporting an APPLIED config is better than refusing
+        every push because the check itself broke.
+        """
+        if not self.validate_queries:
+            return ""
+        get_columns = getattr(self.core, "query_columns", None)
+        if get_columns is None:
+            log.debug("core cannot compile queries; skipping config validation")
+            return ""
+
+        checks: List[Tuple[str, str]] = []
+        schedule = config.get("schedule")
+        if isinstance(schedule, dict):
+            for name, entry in schedule.items():
+                if isinstance(entry, dict) and isinstance(entry.get("query"), str):
+                    checks.append((str(name), entry["query"]))
+
+        packs = config.get("packs")
+        if isinstance(packs, dict):
+            for pack_name, pack in packs.items():
+                queries = pack.get("queries") if isinstance(pack, dict) else None
+                if not isinstance(queries, dict):
+                    continue
+                for name, entry in queries.items():
+                    if isinstance(entry, dict) and isinstance(entry.get("query"), str):
+                        checks.append((f"{pack_name}.{name}", entry["query"]))
+
+        if len(checks) > MAX_QUERIES_VALIDATED:
+            log.warning(
+                "config has %d scheduled queries; compiling only the first %d"
+                " before applying",
+                len(checks),
+                MAX_QUERIES_VALIDATED,
+            )
+            checks = checks[:MAX_QUERIES_VALIDATED]
+
+        for name, sql in checks:
+            try:
+                get_columns(sql)
+            except Exception as exc:  # noqa: BLE001 - any failure is a rejection
+                return f"scheduled query {name!r} does not compile: {exc}"
+        return ""
+
+    # -- state snapshot ----------------------------------------------------
+
+    def refresh_state(self, force: bool = False) -> None:
+        """Read the daemon's schedule, packs and config sources, on an interval.
+
+        Everything here is best effort: a daemon that cannot answer leaves the
+        previous snapshot in place rather than clearing the server's view.
+        """
+        now = self._clock()
+        if not force and now < self._state_deadline:
+            return
+        self._state_deadline = now + self.state_interval
+
+        changed = False
+
+        plugin = self._call_core("active_config_plugin", "")
+        if plugin is not _FAILED and (plugin or "") != self.config_plugin:
+            self.config_plugin = plugin or ""
+            changed = True
+
+        schedule = self._call_core("schedule_state", [])
+        if schedule is not _FAILED and (schedule or []) != self.schedule_state:
+            self.schedule_state = schedule or []
+            changed = True
+
+        packs = self._call_core("packs_state", [])
+        if packs is not _FAILED and (packs or []) != self.packs_state:
+            self.packs_state = packs or []
+            changed = True
+
+        sources = self._call_core("config_sources", {})
+        if sources is not _FAILED and (sources or {}) != self.config_sources:
+            self.config_sources = sources or {}
+            # New sources are worth sending even when health says nothing changed.
+            self._effective_config_dirty = True
+            changed = True
+
+        duplicates = self._find_duplicate_queries(self.schedule_state)
+        if duplicates != self.duplicate_queries:
+            self.duplicate_queries = duplicates
+            changed = True
+
+        if changed:
+            self._health_dirty = True
+
+    def _call_core(self, method: str, default: Any) -> Any:
+        """Call an optional core method.
+
+        Returns ``default`` when the core does not implement the method (an
+        older daemon, a test double) and ``_FAILED`` when the call raised, so a
+        failed read can be told apart from an empty answer and the previous
+        snapshot left in place.
+        """
+        fn = getattr(self.core, method, None)
+        if fn is None:
+            return default
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - a snapshot is never fatal
+            log.debug("core.%s() failed: %s", method, exc)
+            return _FAILED
+
+    @staticmethod
+    def _find_duplicate_queries(schedule: List[Dict[str, str]]) -> List[str]:
+        """Query names that appear more than once in the live schedule.
+
+        osquery merges config sources additively. Two sources defining the same
+        query name therefore produce two live schedules under one name, sharing
+        the counter and diff state, with no warning from the daemon. That is
+        almost always a mistake - a leftover local file next to a managed
+        config - so it is surfaced rather than left to be discovered.
+        """
+        seen: Dict[str, int] = {}
+        for row in schedule:
+            name = row.get("name", "")
+            if name:
+                seen[name] = seen.get(name, 0) + 1
+        return sorted(name for name, count in seen.items() if count > 1)
 
     def _fail(self, message: str, report_hash: Optional[bytes] = None) -> None:
         log.warning("remote config rejected: %s", message)
@@ -412,6 +603,7 @@ class OpampAgent:
             info,
             service_name=self.service_name,
             extension_version=self.extension_version,
+            config_plugin=self.config_plugin or "opamp",
             extra_non_identifying={
                 "osquery.opamp_sequence_num": self.sequence_num,
                 "osquery.opamp_ignored_uid_messages": self._ignored_uid_messages,
@@ -424,29 +616,66 @@ class OpampAgent:
         )
 
     def _build_health(self) -> Any:
+        attributes = [
+            kv("osquery.config_plugin", self.config_plugin or "unknown"),
+            kv("osquery.schedule_query_count", len(self.schedule_state)),
+            kv("osquery.pack_count", len(self.packs_state)),
+        ]
+        if self.schedule_state:
+            attributes.append(
+                kv(
+                    "osquery.schedule",
+                    [f"{row.get('name', '')}@{row.get('interval', '')}" for row in self.schedule_state],
+                )
+            )
+        if self.duplicate_queries:
+            attributes.append(kv("osquery.schedule_duplicates", self.duplicate_queries))
+
         return opamp.ComponentHealth(
             healthy=self.health.healthy,
             start_time_unix_nano=self.start_time_unix_nano,
             last_error=self.health.last_error,
             status=self.health.status,
             status_time_unix_nano=int(self.health.changed_at * 1_000_000_000),
+            attributes=attributes,
         )
 
     def _build_effective_config(self) -> Any:
-        """Report the config we actually delivered, not the bytes we were sent.
+        """Report the config the agent delivered *and* the sources the daemon runs.
 
-        The daemon does not expose its merged configuration, so this is the last
-        applied source plus a hash the server can correlate. Documented as an
-        approximation in docs/opamp-contract.md.
+        Two reasons this is not simply "the bytes we were sent":
+
+        * a daemon can be running config from a plugin we did not touch (the
+          packaged ``/var/osquery/osquery.conf`` next to our pushed source), and
+          a server that cannot see it will misdiagnose every conflict;
+        * reporting sources rather than the merge is the accurate claim: no RPC
+          hands out osquery's merged config, and inventing one would be a lie.
+
+        The pushed config keeps the canonical ``osquery.json`` key. Extra local
+        sources follow as ``osquery.<basename>.json`` - see ``configview``.
         """
         config_map = opamp.AgentConfigMap()
         if self._applied_body is not None:
-            config_map.config_map[constants.CONFIG_OBJECT_NAME].CopyFrom(
+            config_map.config_map[PRIMARY_OBJECT_NAME].CopyFrom(
                 opamp.AgentConfigObject(
                     body=self._applied_body,
                     content_type=constants.CONFIG_CONTENT_TYPE,
                 )
             )
+
+        for name, body in source_documents(self.config_sources).items():
+            try:
+                encoded = body.encode("utf-8")
+            except UnicodeEncodeError:  # pragma: no cover - thrift gives us str
+                log.warning("config source %s is not valid UTF-8; not reporting it", name)
+                continue
+            config_map.config_map[name].CopyFrom(
+                opamp.AgentConfigObject(
+                    body=encoded,
+                    content_type=constants.CONFIG_CONTENT_TYPE,
+                )
+            )
+
         return opamp.EffectiveConfig(config_map=config_map)
 
     def _set_health(self, healthy: bool, status: str, error: str) -> None:
@@ -478,7 +707,12 @@ class OpampAgent:
                 "status": self.health.status,
                 "last_error": self.health.last_error,
             },
+            "config_plugin": self.config_plugin,
+            "scheduled_queries": len(self.schedule_state),
+            "packs": len(self.packs_state),
+            "config_sources": sorted(self.config_sources),
+            "duplicate_queries": list(self.duplicate_queries),
         }
 
 
-__all__ = ["OpampAgent", "Health"]
+__all__ = ["OpampAgent", "Health", "DEFAULT_STATE_INTERVAL", "MAX_QUERIES_VALIDATED"]

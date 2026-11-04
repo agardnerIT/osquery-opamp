@@ -48,6 +48,7 @@ class Daemon:
         config_plugin: str = "filesystem",
         extensions_require: str = "",
         extensions_timeout: str = "3",
+        config: str = "{}\n",
     ) -> None:
         """Boot osqueryd.
 
@@ -64,8 +65,8 @@ class Daemon:
         self.socket = str(root / "osq.em")
         self.log_dir = root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        config_path = root / "config.json"
-        config_path.write_text("{}\n")
+        self.config_path = root / "config.json"
+        self.config_path.write_text(config)
         # Redirect to a file, never a PIPE: a verbose daemon fills a 64 KiB pipe
         # buffer, blocks on write, ignores SIGTERM and hangs teardown. The log is
         # kept on disk so a failing test can still be diagnosed.
@@ -79,7 +80,7 @@ class Daemon:
                 f"--extensions_socket={self.socket}",
                 f"--extensions_interval={extensions_interval}",
                 f"--config_plugin={config_plugin}",
-                f"--config_path={config_path}",
+                f"--config_path={self.config_path}",
                 *([f"--extensions_require={extensions_require}"] if extensions_require else []),
                 f"--extensions_timeout={extensions_timeout}",
                 "--logger_plugin=filesystem",
@@ -127,6 +128,28 @@ class Daemon:
 def daemon():
     root = Path(tempfile.mkdtemp(prefix="osq-"))
     instance = Daemon(root)
+    try:
+        instance.wait_for_socket()
+        yield instance
+    finally:
+        instance.stop()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def daemon_with_local_config():
+    """A daemon whose own config file schedules a query.
+
+    Used for the two-sources-one-query-name case: the file schedules
+    ``battery_stats`` at 30s and a pushed config schedules it again at 5s, which
+    osquery accepts silently and runs twice under one name.
+    """
+    root = Path(tempfile.mkdtemp(prefix="osq-"))
+    instance = Daemon(
+        root,
+        config='{"schedule": {"battery_stats": '
+        '{"query": "select percent_remaining from battery;", "interval": 30}}}\n',
+    )
     try:
         instance.wait_for_socket()
         yield instance

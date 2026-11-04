@@ -387,3 +387,147 @@ def test_registration_does_not_retry_a_real_error(monkeypatch):
     else:
         raise AssertionError("a non-duplicate error must not be retried")
     assert attempts["n"] == 1
+
+
+# -- reading the daemon back -------------------------------------------------
+
+
+def test_core_reads_the_config_sources_the_daemon_is_running(extension, daemon):
+    """The read side of effective config: filesystem genConfig is a pure read."""
+    from osquery_opamp.opamp.configview import config_object_name
+
+    assert extension.core.active_config_plugin() == "filesystem"
+    sources = extension.core.config_sources()
+
+    assert list(sources) == [str(daemon.config_path)]
+    assert sources[str(daemon.config_path)].strip() == "{}"
+    assert config_object_name(str(daemon.config_path)) == "osquery.config.json"
+
+
+def test_core_does_not_read_a_plugin_with_side_effects(extension, monkeypatch):
+    """genConfig on the tls plugin fetches over the network; never call it blind."""
+    monkeypatch.setattr(extension.core, "active_config_plugin", lambda: "tls")
+    assert extension.core.config_sources() == {}
+
+
+def test_core_compiles_a_query_without_running_it(extension):
+    columns = extension.core.query_columns("select percent_remaining from battery;")
+    assert [list(row) for row in columns] == [["percent_remaining"]]
+
+
+def test_core_query_columns_surfaces_osquery_error_text(extension):
+    import pytest as _pytest
+
+    from osquery_opamp.core import CoreError
+
+    with _pytest.raises(CoreError) as excinfo:
+        extension.core.query_columns("select * from batteries;")
+    assert "no such table: batteries" in str(excinfo.value)
+
+
+# -- the agent against a real daemon ----------------------------------------
+
+
+def _agent_for(extension, **kwargs):
+    from osquery_opamp.opamp.agent import OpampAgent
+
+    uid = bytes.fromhex("00112233445566778899aabbccddeeff")
+    return OpampAgent(uid, extension.core, extension_version="0.1.0", **kwargs)
+
+
+def _remote_config(body: bytes):
+    from osquery_opamp.opamp import constants
+    from osquery_opamp.opamp.pb import opamp
+
+    return opamp.ServerToAgent(
+        instance_uid=bytes.fromhex("00112233445566778899aabbccddeeff"),
+        remote_config=opamp.AgentRemoteConfig(
+            config=opamp.AgentConfigMap(
+                config_map={
+                    constants.CONFIG_OBJECT_NAME: opamp.AgentConfigObject(
+                        body=body, content_type="application/json"
+                    )
+                }
+            )
+        ),
+    )
+
+
+def test_agent_refuses_a_scheduled_query_that_cannot_compile(extension):
+    """osquery would accept it; the agent is the only thing that can say no."""
+    import json
+
+    from osquery_opamp.opamp.pb import opamp
+
+    agent = _agent_for(extension)
+    agent.handle(
+        _remote_config(
+            json.dumps(
+                {"schedule": {"ghost": {"query": "select * from no_such_table;", "interval": 30}}}
+            ).encode()
+        )
+    )
+
+    assert agent.remote_config_status == opamp.RemoteConfigStatuses_FAILED
+    assert "no such table: no_such_table" in agent.remote_config_error
+    assert "ghost" not in {row["name"] for row in extension.core.scheduled_queries()}
+
+
+def test_agent_reports_local_sources_alongside_the_pushed_config(extension, daemon):
+    import json
+
+    from osquery_opamp.opamp import constants
+
+    agent = _agent_for(extension)
+    agent.handle(
+        _remote_config(
+            json.dumps(
+                {"schedule": {"pushed": {"query": "select 1 from time;", "interval": 300}}}
+            ).encode()
+        )
+    )
+    agent.server_capabilities = constants.SERVER_ACCEPTS_EFFECTIVE_CONFIG
+
+    config_map = agent.next_message().effective_config.config_map.config_map
+
+    assert sorted(config_map) == ["osquery.config.json", "osquery.json"]
+    assert json.loads(config_map["osquery.json"].body)["schedule"]["pushed"]
+    assert config_map["osquery.config.json"].body.decode().strip() == "{}"
+
+
+def test_agent_detects_one_query_defined_by_two_config_sources(daemon_with_local_config):
+    """A pushed query name that the local file also defines runs twice, silently."""
+    import json
+
+    from osquery_opamp.extension import OsqueryExtension
+    from osquery_opamp.opamp.pb import opamp
+
+    extension = OsqueryExtension(daemon_with_local_config.socket, version="0.1.0")
+    extension.start()
+    try:
+        assert [row["name"] for row in extension.core.scheduled_queries()] == ["battery_stats"]
+
+        agent = _agent_for(extension)
+        agent.handle(
+            _remote_config(
+                json.dumps(
+                    {
+                        "schedule": {
+                            "battery_stats": {
+                                "query": "select percent_remaining from battery;",
+                                "interval": 5,
+                            }
+                        }
+                    }
+                ).encode()
+            )
+        )
+
+        assert (
+            agent.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
+        ), "the config itself is still applied"
+        assert agent.duplicate_queries == ["battery_stats"]
+        assert agent.health.status == "config_conflict"
+        assert "battery_stats" in agent.health.last_error
+    finally:
+        extension.stop()

@@ -111,3 +111,63 @@ def test_cli_shuts_down_cleanly_and_deregisters(cli, daemon):
     assert disconnects, "agent_disconnect was not sent"
     log = log_path.read_text()
     assert "Traceback" not in log, log[-2000:]
+
+
+def test_flags_default_to_validation_and_a_one_minute_state_interval():
+    import sys
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "src"))
+    from osquery_opamp.__main__ import build_parser
+
+    args = build_parser().parse_args(["--endpoint", "ws://127.0.0.1:4320/v1/opamp"])
+    assert args.no_validate_queries is False
+    assert args.state_interval == 60.0
+
+    tuned = build_parser().parse_args(
+        ["--endpoint", "ws://127.0.0.1:4320/v1/opamp", "--no-validate-queries", "--state-interval", "5"]
+    )
+    assert tuned.no_validate_queries is True
+    assert tuned.state_interval == 5.0
+
+
+def test_cli_reports_a_config_whose_query_cannot_compile(cli, daemon):
+    """The end-to-end version of the validation path: refusal, with osquery's words."""
+    server, process, _ = cli
+    server.wait_for(lambda m: m.HasField("agent_description"), timeout=20)
+
+    server.push_config(
+        {"schedule": {"ghost": {"query": "select * from no_such_table;", "interval": 300}}}
+    )
+    failed = server.wait_for(
+        lambda m: m.remote_config_status.status == opamp.RemoteConfigStatuses_FAILED, timeout=20
+    )
+    assert "no such table: no_such_table" in failed.remote_config_status.error_message
+
+    core = CoreClient(daemon.socket)
+    assert "ghost" not in {row["name"] for row in core.scheduled_queries()}
+    assert process.poll() is None, "a bad config must not take the agent down"
+
+    # A corrected config is accepted, so the refusal is not sticky.
+    server.push_config(
+        {"schedule": {"fixed": {"query": "select 1 from time;", "interval": 300}}}
+    )
+    applied = server.wait_for(
+        lambda m: m.remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED, timeout=20
+    )
+    assert applied.remote_config_status.error_message == ""
+    assert "fixed" in {row["name"] for row in CoreClient(daemon.socket).scheduled_queries()}
+
+
+def test_cli_reports_the_daemons_own_config_source_in_effective_config(cli, daemon):
+    server, process, _ = cli
+    server.wait_for(lambda m: m.HasField("agent_description"), timeout=20)
+
+    report = server.wait_for(
+        lambda m: m.HasField("effective_config")
+        and len(m.effective_config.config_map.config_map) > 0,
+        timeout=20,
+        description="effective config with at least one source",
+    )
+    keys = set(report.effective_config.config_map.config_map)
+    assert "osquery.config.json" in keys, keys

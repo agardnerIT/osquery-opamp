@@ -17,7 +17,7 @@ import threading
 from typing import List, Optional
 
 from .extension import OsqueryExtension
-from .opamp.agent import OpampAgent
+from .opamp.agent import DEFAULT_STATE_INTERVAL, OpampAgent
 from .opamp.client import OpampClient
 from .opamp.constants import (
     DEFAULT_HEARTBEAT_SECONDS,
@@ -103,6 +103,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="advertise com.osquery.query and run ad-hoc SQL from the server",
     )
+    parser.add_argument(
+        "--state-interval",
+        type=float,
+        default=DEFAULT_STATE_INTERVAL,
+        help=(
+            "seconds between reads of the daemon's live schedule, packs and config"
+            " sources, reported with agent health (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--no-validate-queries",
+        action="store_true",
+        help=(
+            "apply pushed configs without pre-compiling their scheduled queries;"
+            " by default a config whose SQL does not compile is rejected"
+        ),
+    )
     parser.add_argument("--log-level", default="INFO", help="debug, info, warning, error")
     return parser
 
@@ -150,6 +167,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         query_runner=(lambda sql: (extension.core.query(sql), None)) if args.enable_commands else None,
         identity_store=identity,
         sdk_version_source=extension.sdk_version_source,
+        validate_queries=not args.no_validate_queries,
+        state_interval=args.state_interval,
     )
     client = OpampClient(
         agent,
