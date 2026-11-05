@@ -533,6 +533,62 @@ def test_agent_detects_one_query_defined_by_two_config_sources(daemon_with_local
         extension.stop()
 
 
+def test_a_resolved_duplicate_clears_the_conflict_without_an_apply(
+    daemon_with_local_config, monkeypatch
+):
+    """The operator's fix arrives as a *state* change, not a new config.
+
+    Deleting the local query (or moving the daemon to ``--config_plugin=opamp``) leaves
+    the pushed config untouched, so no apply happens — health has to be re-derived in
+    ``refresh_state`` or the agent reports `config_conflict` forever and the fleet
+    manager's rollout stays paused after the host is clean.
+    """
+    import json
+
+    from osquery_opamp.extension import OsqueryExtension
+
+    extension = OsqueryExtension(daemon_with_local_config.socket, version="0.1.0")
+    extension.start()
+    try:
+        agent = _agent_for(extension)
+        agent.handle(
+            _remote_config(
+                json.dumps(
+                    {
+                        "schedule": {
+                            "battery_stats": {
+                                "query": "select percent_remaining from battery;",
+                                "interval": 5,
+                            }
+                        }
+                    }
+                ).encode()
+            )
+        )
+        assert agent.health.status == "config_conflict"
+
+        # Only the local schedule is left (the pushed source and the file no longer
+        # define the same name), which is what the daemon reports after the fix.
+        monkeypatch.setattr(
+            extension.core,
+            "schedule_state",
+            lambda: [
+                {
+                    "name": "battery_stats",
+                    "interval": "5",
+                    "query": "select percent_remaining from battery;",
+                }
+            ],
+        )
+        agent.refresh_state(force=True)
+
+        assert agent.duplicate_queries == []
+        assert agent.health.status == "ok"
+        assert agent.health.last_error == ""
+    finally:
+        extension.stop()
+
+
 # --------------------------------------- durability: genConfig after a restart
 
 BODY_TEXT = '{"schedule": {"battery_stats": {"query": "SELECT percent_remaining FROM battery;", "interval": 30}}}'

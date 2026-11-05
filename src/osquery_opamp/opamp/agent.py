@@ -443,13 +443,7 @@ class OpampAgent:
         # ``state_interval`` ago.
         self.refresh_state(force=True)
         if self.duplicate_queries:
-            self._set_health(
-                True,
-                "config_conflict",
-                "the same query name is scheduled more than once: "
-                + ", ".join(self.duplicate_queries)
-                + " (a pushed source and a local config source both define it)",
-            )
+            self._set_health(True, "config_conflict", self._conflict_error())
         else:
             self._set_health(True, "ok", "")
         log.info(
@@ -550,6 +544,16 @@ class OpampAgent:
         duplicates = self._find_duplicate_queries(self.schedule_state)
         if duplicates != self.duplicate_queries:
             self.duplicate_queries = duplicates
+            # Re-derive the conflict status here, not only in `_apply`: the duplicate
+            # disappears when the *other* source goes away (the operator deletes the
+            # local query, or moves the daemon to `--config_plugin=opamp`), and nothing
+            # is applied at that moment. Without this the agent keeps reporting
+            # `config_conflict` for a schedule that is now clean, and a fleet manager
+            # gating on that status can never re-open the paused rollout.
+            if duplicates:
+                self._set_health(True, "config_conflict", self._conflict_error())
+            elif self.health.status == "config_conflict":
+                self._set_health(True, "ok", "")
             changed = True
 
         if changed:
@@ -571,6 +575,13 @@ class OpampAgent:
         except Exception as exc:  # noqa: BLE001 - a snapshot is never fatal
             log.debug("core.%s() failed: %s", method, exc)
             return _FAILED
+
+    def _conflict_error(self) -> str:
+        return (
+            "the same query name is scheduled more than once: "
+            + ", ".join(self.duplicate_queries)
+            + " (a pushed source and a local config source both define it)"
+        )
 
     @staticmethod
     def _find_duplicate_queries(schedule: List[Dict[str, str]]) -> List[str]:
