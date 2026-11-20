@@ -22,7 +22,7 @@ osquery side
 - config push into the live schedule, per-source replacement semantics
 - config hash / validity read-back, scheduled-query read-back
 - pull mode (`--config_plugin=opamp`), including a real daemon booting on a
-  config served by `genConfig` - see "Pull mode" below
+  config served by `genConfig` - see "Push or pull?" below
 - **config survives a restart.** The last accepted body and its OpAMP hash are
   cached (`--config-cache`, `0600`, atomic). A restarted extension or daemon is
   served it at boot, and in pull mode the agent re-reports `APPLIED` with the same
@@ -99,18 +99,57 @@ long a pull-mode config request may block, `--state-interval` to change how ofte
 the daemon's live schedule is read, and `--no-validate-queries` to push configs
 without pre-compiling their SQL. `--help` lists all of them.
 
-### Pull mode
+### Push or pull?
 
-`--config_plugin=opamp` needs **two** flags on the daemon, not one:
+Two ways to wire this up. The difference is who owns the config.
+
+**Pull (recommended).** osquery asks us for its config; we answer with what the
+server gave us. Start the daemon with:
 
 ```bash
 osqueryd --config_plugin=opamp --extensions_require=opamp --extensions_timeout=30
 ```
 
-`--extensions_require` makes osquery wait for the extension inside
-`startExtensionManager()`, which runs before `initActivePlugin("config", ...)`
-and before config is loaded. Without it, osqueryd does not degrade gracefully -
-it exits during startup:
+Both flags are required. With only `--config_plugin=opamp`, osqueryd exits at
+startup with `Unknown registry plugin: opamp`.
+
+In this mode osqueryd has no config file of its own: `--config_path` is ignored.
+The last config the daemon accepted is cached by the agent, so a restart - of the
+daemon, or of the whole machine - comes back up on that config even if the
+server is unreachable. This is the only mode where the server is the source of
+truth.
+
+**Push.** Leave the daemon alone (it keeps `--config_plugin=filesystem`) and the
+agent merges the server's config in at runtime as an extra config source.
+
+The caveats are real, so read them:
+
+- the file on disk is never modified - the pushed config lives in memory only
+- a daemon restart discards it: after a reboot the host runs its file again
+  until the server re-sends
+- a query name that exists in both the file and the pushed config shows up in the
+  schedule **twice**, carrying both intervals, so it can run at either.
+  `RemoteConfigStatus` reports this as `config_conflict`.
+
+So in push mode, treat the file and the server as two authors with a shared
+namespace: either delete from the file what the server should own, or keep the
+two sets of query names disjoint.
+
+Use pull for anything long-lived. Use push for a pilot, or where you cannot
+change the daemon's startup flags, and then only for query names the local file
+does not define.
+
+**Piloting?** Start with reporting only - let the agent send description, health
+and the live schedule, and have the server send no config. Nothing can break,
+and you find out whether the reports are accurate before config delivery is
+turned on.
+
+### Pull mode, in detail
+
+Why `--extensions_require` is required rather than merely advised: it makes
+osquery wait for the extension inside `startExtensionManager()`, which runs
+before `initActivePlugin("config", ...)` and before config is loaded. Without
+it, osqueryd does not degrade gracefully - it exits during startup:
 
 ```
 E shutdown.cpp:80] Cannot activate opamp config plugin: Unknown registry plugin: opamp
