@@ -355,7 +355,10 @@ class OpampAgent:
     def _apply_remote_config(self, remote_config: Any) -> None:
         entries = dict(remote_config.config.config_map)
         if not entries:
-            self._fail("remote config contained no configuration objects")
+            # Not a malformed message: an empty config map is the spec's withdrawal,
+            # the way a server says "run your own config" (the reference server
+            # withdraws a desired config by sending exactly this).
+            self._withdraw_remote_config(remote_config)
             return
 
         name = constants.CONFIG_OBJECT_NAME
@@ -448,6 +451,69 @@ class OpampAgent:
             self._set_health(True, "ok", "")
         log.info(
             "applied remote config (%d bytes, hash=%s)", len(body), report_hash.hex()[:16]
+        )
+
+    def _withdraw_remote_config(self, remote_config: Any) -> None:
+        """Clear the source this agent pushes, because the server withdrew its config.
+
+        osquery has no RPC that drops a config source, but ``Config::update()``
+        *replaces* one in place, so pushing ``{}`` under our source empties it: the
+        daemon's own config is the only thing still scheduling anything. That is what
+        a withdrawal means in push mode, and in pull mode (``--config_plugin=opamp``)
+        it is what ``genConfig`` should answer - the agent runs nothing rather than
+        the config it was just told to forget.
+
+        Treating the empty map as malformed (the previous behaviour) had two
+        consequences: the revision was poisoned, so a withdrawal could never
+        succeed, and the pushed source stayed merged into the daemon with no way to
+        remove it - getting back to the local file needed a ``osqueryd`` restart.
+        """
+        body = b"{}"
+        computed = hashlib.sha256(body).digest()
+        # Same rule as an ordinary config: the server's hash is what it correlates
+        # on, so use it verbatim and only compute our own when it is absent.
+        report_hash = bytes(remote_config.config_hash) if remote_config.config_hash else computed
+
+        if (
+            report_hash == self.last_remote_config_hash
+            and self.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
+        ):
+            # Desired-state servers re-offer the active config on every reply, and a
+            # withdrawal is now the active config. Re-pushing it would churn the
+            # daemon's config hash for nothing.
+            log.debug(
+                "withdrawal unchanged (hash=%s); not re-applying", report_hash.hex()[:16]
+            )
+            self._remember(body, report_hash, constants.CONFIG_CONTENT_TYPE)
+            self._effective_config_dirty = True
+            return
+
+        self.remote_config_status = opamp.RemoteConfigStatuses_APPLYING
+        self.remote_config_error = ""
+        self._status_dirty = True
+
+        result = self.core.push_config_raw(self.source, body.decode("utf-8"))
+        if not result.ok:
+            self._fail(f"osquery rejected the withdrawn config: {result.message}", report_hash)
+            return
+
+        self._applied_body = body
+        self._applied_config = {}
+        # A restart must be served the withdrawal too, not the body it replaced.
+        self._remember(body, report_hash, constants.CONFIG_CONTENT_TYPE)
+        self.last_remote_config_hash = report_hash
+        self.remote_config_status = opamp.RemoteConfigStatuses_APPLIED
+        self.remote_config_error = ""
+        self._status_dirty = True
+        self._effective_config_dirty = True
+        self.refresh_state(force=True)
+        if self.duplicate_queries:
+            self._set_health(True, "config_conflict", self._conflict_error())
+        else:
+            self._set_health(True, "ok", "")
+        log.info(
+            "remote config withdrawn (hash=%s); the daemon's own config is the only source",
+            report_hash.hex()[:16],
         )
 
     # -- config validation -------------------------------------------------

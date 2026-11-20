@@ -19,7 +19,8 @@ Working and tested against a real `osqueryd` 5.24.0 (65 tests, ~58s):
 osquery side
 - extension registration and liveness (the daemon pings us and drops us after two
   misses, so the extension serves its own Thrift socket)
-- config push into the live schedule, per-source replacement semantics
+- config push into the live schedule, per-source replacement semantics, and
+  withdrawal (an empty `config_map`) that empties the pushed source in place
 - config hash / validity read-back, scheduled-query read-back
 - pull mode (`--config_plugin=opamp`), including a real daemon booting on a
   config served by `genConfig` - see "Push or pull?" below
@@ -62,17 +63,29 @@ Not implemented, and not advertised in the capability bitmask
 - connection settings (`ConnectionSettingsOffers`)
 - the *merged* config: no RPC exposes it, so sources are reported instead
 
-## Run it
+## Quick Start: Push Mode
 
-```bash
-sudo .venv/bin/python -m osquery_opamp \
-    --header 'Authorization: Bearer <token>'
+`osqueryd` needs no modifications to be able to work with OpAMP. This repo runs alongside your standard osqueryd in a different terminal.
+
+`osqueryd` can act in two different "modes": `push` mode or `pull` mode. The quickstart describes the most basic `push` mode.
+
+1. Check that `--config_plugin=filesystem` listed
+2. Generate an API token from your OpAMP server ([example server]())
+3. Git clone this code (see below)
+4. Start the osquery-opamp extension (see below)
+
+```
+git clone https://github.com/agardnerit/osquery-opamp
+cd osquery-opamp
+python -m venv .venv
+source .venv/bin/activate
+sudo .venv/bin/python -m osquery_opamp --header 'Authorization: Bearer <token>' --endpoint http://localhost:4320/v1/opamp
 ```
 
-That is the whole command: the endpoint defaults to
-`http://localhost:4320/v1/opamp`, and the osquery socket to the platform's
-default. Plain HTTP is the spec's request/reply transport and the one every
-OpAMP server answers without being configured, so it is the default here too.
+Where `<token>` is an auth token provided by your OpAMP server.
+
+
+## HTTP (https://), Websockets (ws://) and Secure WebSockets (wss://)
 
 Point it elsewhere with `--endpoint`. The scheme picks the transport:
 
@@ -103,8 +116,8 @@ without pre-compiling their SQL. `--help` lists all of them.
 
 Two ways to wire this up. The difference is who owns the config.
 
-**Pull (recommended).** osquery asks us for its config; we answer with what the
-server gave us. Start the daemon with:
+**Pull (recommended).** osquery asks the OpAMP extension for its config; the OpAMP extension answers with what the
+OpAMP server provided to us. Start the daemon with:
 
 ```bash
 osqueryd --config_plugin=opamp --extensions_require=opamp --extensions_timeout=30
@@ -112,6 +125,10 @@ osqueryd --config_plugin=opamp --extensions_require=opamp --extensions_timeout=3
 
 Both flags are required. With only `--config_plugin=opamp`, osqueryd exits at
 startup with `Unknown registry plugin: opamp`.
+
+That error has two causes that produce identical output: the agent is not
+running, or `--extensions_require` is missing. The registry query under "Run it"
+tells you which, and running the agent is the prerequisite either way.
 
 In this mode osqueryd has no config file of its own: `--config_path` is ignored.
 The last config the daemon accepted is cached by the agent, so a restart - of the
@@ -247,6 +264,16 @@ config structure eagerly and validates SQL at execution time.
 So an OpAMP `APPLIED` status means "accepted and merged", **not** "the queries
 work". Per-query failures show up in `osquery_schedule` and the status logs. See
 `docs/opamp-contract.md`.
+
+**Withdrawal is honoured.** The spec has no "delete the config" message: a
+server withdraws by sending a `RemoteConfig` with an empty `config_map`. The agent
+reports `APPLIED` and pushes `{}` under its own source, which `Config::update()`
+replaces in place, so a daemon in push mode goes back to scheduling only what its
+own file says (and in pull mode `genConfig` answers `{}` - it runs nothing rather
+than the config it was told to forget). Reporting that as `FAILED`, as this did
+before, poisoned the revision *and* left the pushed source merged in the daemon
+with no RPC to remove it: the only way back to the local file was restarting
+`osqueryd`.
 
 Except: the agent compiles every scheduled query before pushing, so a config
 that would fail at execution time is refused with osquery's own error text

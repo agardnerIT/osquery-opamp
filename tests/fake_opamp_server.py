@@ -115,6 +115,15 @@ class _RecordingServer:
         self.send(self.server_state(remote_config=remote))
         return body
 
+    def push_withdrawal(self, config_hash: bytes = b"withdrawn") -> bytes:
+        """Withdraw the remote config: an empty `config_map`, which is the spec's
+        "run your own config" (the reference server sends exactly this)."""
+        remote = opamp.AgentRemoteConfig(
+            config=opamp.AgentConfigMap(), config_hash=config_hash
+        )
+        self.send(self.server_state(remote_config=remote))
+        return config_hash
+
     def send_query(self, sql: str, request_id: str = "q-1") -> None:
         self.send(
             self.server_state(

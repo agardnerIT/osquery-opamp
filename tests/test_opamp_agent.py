@@ -436,3 +436,84 @@ def test_persistence_failure_does_not_fail_the_apply(tmp_path):
     agent = make_agent(FakeCore(), config_service=BrokenService(), pull_mode=True)
     agent.handle(remote_config(BODY_TEXT.encode(), config_hash=SERVER_HASH))
     assert agent.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
+
+
+# ------------------------------------------------------- withdrawal (empty map)
+
+
+def withdrawal(config_hash=b"", name=None):
+    """The spec's "run your own config": a `RemoteConfig` with no objects in it."""
+    return opamp.ServerToAgent(
+        instance_uid=UID,
+        remote_config=opamp.AgentRemoteConfig(
+            config=opamp.AgentConfigMap(), config_hash=config_hash
+        ),
+    )
+
+
+CONFIG = {"schedule": {"pushed_stats": {"query": "select 1;", "interval": 60}}}
+
+
+def test_a_withdrawal_clears_the_pushed_source_and_reports_applied():
+    """An empty config map is a state, not a malformed message.
+
+    Treating it as a failure poisoned the revision and left the pushed source merged
+    into the daemon with no RPC to remove it, so "back to the local file" required
+    restarting osqueryd.
+    """
+    core = FakeCore()
+    agent = make_agent(core)
+    agent.handle(remote_config(json.dumps(CONFIG).encode("utf-8"), config_hash=b"rev-1"))
+    assert core.pushes[-1][1] == json.dumps(CONFIG)
+
+    agent.handle(withdrawal(config_hash=b"rev-2"))
+
+    assert agent.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
+    assert agent.remote_config_error == ""
+    assert core.pushes[-1] == (constants.DEFAULT_SOURCE, "{}"), (
+        "Config::update() replaces a source in place, so an empty body is how it is dropped"
+    )
+    assert agent._applied_config == {}
+
+    status = agent.next_message().remote_config_status
+    assert status.status == opamp.RemoteConfigStatuses_APPLIED
+    assert status.last_remote_config_hash == b"rev-2"
+    assert agent.health.status == "ok"
+
+
+def test_a_daemon_that_refuses_the_withdrawal_is_still_failed():
+    core = FakeCore(accept=False)
+    agent = make_agent(core)
+    agent.handle(withdrawal(config_hash=b"rev-2"))
+    assert agent.remote_config_status == opamp.RemoteConfigStatuses_FAILED
+    assert "Error parsing the config JSON" in agent.remote_config_error
+
+
+def test_a_repeated_withdrawal_is_not_pushed_again():
+    """Desired-state servers re-offer the active config; a withdrawal is one."""
+    core = FakeCore()
+    agent = make_agent(core)
+    agent.handle(withdrawal(config_hash=b"rev-2"))
+    pushes = len(core.pushes)
+
+    agent.handle(withdrawal(config_hash=b"rev-2"))
+
+    assert len(core.pushes) == pushes, "the same hash must not churn the daemon's config"
+    assert agent.remote_config_status == opamp.RemoteConfigStatuses_APPLIED
+
+
+def test_the_withdrawal_replaces_the_cached_body(tmp_path):
+    """A restart must not be served the config the server just withdrew."""
+    from osquery_opamp.configcache import ConfigCache
+    from osquery_opamp.extension import ExtensionService
+
+    service = ExtensionService(ConfigCache(tmp_path / "config.json"))
+    agent = make_agent(FakeCore(), config_service=service, pull_mode=True)
+    agent.handle(remote_config(json.dumps(CONFIG).encode("utf-8"), config_hash=b"rev-1"))
+    assert json.loads(service.cached_entry().body) == CONFIG
+
+    agent.handle(withdrawal(config_hash=b"rev-2"))
+
+    entry = service.cached_entry()
+    assert json.loads(entry.body) == {}
+    assert entry.config_hash == b"rev-2".hex()
