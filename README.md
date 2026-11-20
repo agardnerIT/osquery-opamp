@@ -1,5 +1,7 @@
 # osquery-opamp
 
+![osquery connected to an OpAMP Server](assets/osquery-connected-to-server.png)
+
 An OpAMP agent for osquery, delivered as an **osquery extension**.
 
 No changes to osquery's core. The extension registers with the daemon over the
@@ -11,6 +13,27 @@ registry calls that already exist:
 | deliver remote config | `--config_plugin=opamp` → `genConfig` (persistent, the recommended mode); `call("config", "update", ...)` → `Config::update()` merges a config source (push mode) |
 | report what is actually running | `query("select ... from osquery_info / osquery_schedule")` |
 | answer `--config_plugin=opamp` (pull mode) | the `config/opamp` registry item we advertise |
+
+## Quick Start: Push Mode
+
+`osqueryd` needs no modifications to be able to work with OpAMP. This repo runs alongside your standard osqueryd in a different terminal.
+
+`osqueryd` can act in two different "modes": `push` mode or `pull` mode. The quickstart describes the most basic `push` mode.
+
+1. Check that `--config_plugin=filesystem` listed
+2. Generate an API token from your OpAMP server ([example server]())
+3. Git clone this code (see below)
+4. Start the osquery-opamp extension (see below)
+
+```
+git clone https://github.com/agardnerit/osquery-opamp
+cd osquery-opamp
+python -m venv .venv
+source .venv/bin/activate
+sudo .venv/bin/python -m osquery_opamp --header 'Authorization: Bearer <token>' --endpoint http://localhost:4320/v1/opamp
+```
+
+Where `<token>` is an auth token provided by [your OpAMP server](https://github.com/agardnerIT/opamp-server-py)
 
 ## Status
 
@@ -62,27 +85,6 @@ Not implemented, and not advertised in the capability bitmask
 - packages, `own_metrics`/`own_traces`/`own_logs`
 - connection settings (`ConnectionSettingsOffers`)
 - the *merged* config: no RPC exposes it, so sources are reported instead
-
-## Quick Start: Push Mode
-
-`osqueryd` needs no modifications to be able to work with OpAMP. This repo runs alongside your standard osqueryd in a different terminal.
-
-`osqueryd` can act in two different "modes": `push` mode or `pull` mode. The quickstart describes the most basic `push` mode.
-
-1. Check that `--config_plugin=filesystem` listed
-2. Generate an API token from your OpAMP server ([example server]())
-3. Git clone this code (see below)
-4. Start the osquery-opamp extension (see below)
-
-```
-git clone https://github.com/agardnerit/osquery-opamp
-cd osquery-opamp
-python -m venv .venv
-source .venv/bin/activate
-sudo .venv/bin/python -m osquery_opamp --header 'Authorization: Bearer <token>' --endpoint http://localhost:4320/v1/opamp
-```
-
-Where `<token>` is an auth token provided by your OpAMP server.
 
 
 ## HTTP (https://), Websockets (ws://) and Secure WebSockets (wss://)
