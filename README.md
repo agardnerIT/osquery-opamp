@@ -1,4 +1,5 @@
 # osquery-opamp
+![Warning: Entirely vibecoded](https://img.shields.io/badge/Warning-Entirely%20vibecoded-orange?style=for-the-badge)
 
 ![osquery connected to an OpAMP Server](assets/osquery-connected-to-server.png)
 
