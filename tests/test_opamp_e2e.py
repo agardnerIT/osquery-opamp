@@ -167,3 +167,49 @@ def test_client_reconnects_after_the_server_drops_it(wired):
         description="full state after reconnect",
     )
     assert message.sequence_num > last_sequence, "sequence numbers continue across reconnects"
+
+
+def test_a_withdrawal_hands_the_daemon_back_to_its_own_config(daemon_with_local_config):
+    """Empty config map -> our source is emptied, the local file's query survives.
+
+    Push mode merges our source next to the daemon's file, so a withdrawal has to
+    *clear* ours. Before this, the empty map was reported FAILED and the pushed
+    query stayed in the live schedule until someone restarted osqueryd.
+    """
+    from osquery_opamp.extension import OsqueryExtension
+
+    daemon = daemon_with_local_config
+    ext = OsqueryExtension(daemon.socket, version="0.1.0")
+    ext.start()
+    try:
+        with FakeOpampServer() as server:
+            agent, client = build_client(server, ext.core)
+            client.start()
+            server.wait_for_connection()
+            try:
+                server.push_config(
+                    {"schedule": {"e2e_pushed": {"query": "select 1 as n from osquery_info;", "interval": 300}}},
+                    config_hash=b"rev-1",
+                )
+                server.wait_for(
+                    lambda m: m.remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED
+                    and m.remote_config_status.last_remote_config_hash == b"rev-1",
+                    description="APPLIED for the pushed config",
+                )
+                assert "e2e_pushed" in {row["name"] for row in ext.core.scheduled_queries()}
+
+                server.push_withdrawal(config_hash=b"rev-2")
+                server.wait_for(
+                    lambda m: m.remote_config_status.status == opamp.RemoteConfigStatuses_APPLIED
+                    and m.remote_config_status.last_remote_config_hash == b"rev-2",
+                    description="APPLIED for the withdrawal",
+                )
+
+                schedule = {row["name"]: row for row in ext.core.scheduled_queries()}
+                assert "e2e_pushed" not in schedule, "the withdrawn source still schedules a query"
+                assert set(schedule) == {"battery_stats"}, "the daemon's own config must survive"
+                assert schedule["battery_stats"]["interval"] == "30"
+            finally:
+                client.stop()
+    finally:
+        ext.stop()
