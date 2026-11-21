@@ -5,6 +5,12 @@
 
 An OpAMP agent for osquery, delivered as an **osquery extension**.
 
+## What is OpAMP?
+OpAMP is an open protocol defined and stewarded by the OpenTelemetry project for agent (aka client) fleet management. In short, any "agent" that speaks OpAMP can be centrally managed from an OpAMP server.
+
+This repo adds OpAMP support to osquery (as an extension)
+
+
 No changes to osquery's core. The extension registers with the daemon over the
 documented Thrift API (`osquery/extensions/thrift/osquery.thrift`) and uses
 registry calls that already exist:
